@@ -19,19 +19,65 @@ def log_debug(msg: str):
 def log_info(msg: str):
     print(msg)
 
+def extract_pure_fund_code(fund_code_with_tag):
+    """提取纯基金代码，去掉自定义板块标签"""
+    if '[' in fund_code_with_tag:
+        return fund_code_with_tag.split('[')[0]
+    return fund_code_with_tag
+
+def sort_funds_by_category(fund_list):
+    """按板块分类排序基金列表"""
+    if not fund_list:
+        return fund_list
+    
+    # 定义板块优先级顺序
+    category_priority = {
+        # 港股板块
+        "港股": 1,
+        # 核心科技板块
+        "港股科技": 2, "科技": 3, "半导体": 4, "计算机": 5, "电子": 6, "通信": 7, "人工智能": 8, "机器人": 9,
+        # 金融地产
+        "港股金融": 10,"金融": 11, "地产": 12, "建筑装饰": 13, "建筑材料": 14,
+        # 新兴产业
+        "新能源": 15, "光伏": 16, "风电": 17, "储能": 18, "新能源汽车": 19, "消费电子": 20,
+        # 传统优势板块
+        "军工": 21,  "港股医药": 22, "医药": 23, "消费": 24, "食品饮料": 25, "家电": 26, "汽车": 27,
+        # 金属细分板块
+        "贵金属": 28, "有色金属": 29, "稀土": 30, 
+        # 周期板块
+        "化工": 31, "钢铁": 32, "煤炭": 33, "电力": 34, "机械设备": 35, "电气设备": 36,
+        # 其他板块
+        "农业": 37, "基建": 38, "传媒": 39, "环保": 40, "教育": 41, "物流": 42,
+        "纺织服装": 43, "轻工制造": 44, "公用事业": 45, "交通运输": 46, "商业贸易": 47, "休闲服务": 48, "综合": 49,
+        # 基金类型分类
+        "ETF基金": 50, "LOF基金": 51, "ETF联接": 52, "混合型": 53, "股票型": 54, "债券型": 55, "货币型": 56, "指数型": 57,
+        # 其他分类
+        "场内基金": 58, "其他": 59, "未知": 60
+    }
+    
+    def get_category_priority(fund):
+        category = fund.get('板块分类', '未知')
+        return category_priority.get(category, 999)
+    
+    # 按板块优先级排序，相同板块内按基金代码排序
+    return sorted(fund_list, key=lambda x: (get_category_priority(x), x.get('基金代码', '')))
+
 def sort_by_original_order(fund_list, original_order):
     """按照原始定义的顺序排序基金"""
     if not fund_list or not original_order:
         return fund_list
     
-    # 创建基金代码到基金的映射
-    fund_dict = {fund['基金代码']: fund for fund in fund_list}
+    # 创建基金代码到基金的映射，需要处理自定义标签
+    fund_dict = {}
+    for fund in fund_list:
+        fund_dict[fund['基金代码']] = fund
     
     # 按照原始顺序重新排列
     sorted_list = []
     for code in original_order:
-        if code in fund_dict:
-            sorted_list.append(fund_dict[code])
+        pure_code = extract_pure_fund_code(code)
+        if pure_code in fund_dict:
+            sorted_list.append(fund_dict[pure_code])
     
     return sorted_list
 
@@ -73,10 +119,15 @@ class FundCategoryClassifier:
             "农业": ["农业", "养殖", "种植", "农产品", "农业股", "种植业", "畜牧业", "渔业", "林业", "种子", "化肥", "农药", "农机", "农业服务", "乡村振兴", "智慧农业"],
             
             # 贵金属板块
-            "黄金": ["黄金", "贵金属", "有色金属", "黄金股", "白银", "铂金", "钯金", "稀土", "铜", "铝", "锌", "镍", "钴", "锂", "金属矿业", "矿业股"],
+            "贵金属": ["贵金属", "黄金", "黄金股", "白银", "铂金", "钯金"],
+            "有色金属": ["有色金属", "铜", "铝", "锌", "镍", "钴", "锂", "金属矿业", "矿业股"],
+            "稀土": ["稀土", "稀土金属", "稀土元素", "稀土材料"],
             
             # 港股板块
             "港股": ["港股", "恒生", "香港", "港股通", "H股", "红筹股", "蓝筹股", "中概股", "港股科技", "港股消费", "港股金融", "港股地产"],
+            "港股科技": ["港股科技", "港股通科技", "恒生科技", "港股互联网", "港股TMT"],
+            "港股金融": ["港股金融", "港股通金融", "恒生金融", "港股银行", "港股保险"],
+            "港股医药": ["港股医药", "港股通医药", "港股医疗", "港股生物医药"],
             
             # 智能制造板块
             "机器人": ["机器人", "智能制造", "工业4.0", "自动化", "工业机器人", "服务机器人", "特种机器人", "智能制造装备", "工业自动化", "数字化制造", "柔性制造", "精益制造"],
@@ -137,49 +188,47 @@ class FundCategoryClassifier:
             "LOF基金": ["LOF", "上市型开放式基金", "场内LOF", "场外LOF"]
         }
     
-    def classify_fund(self, fund_name):
-        """根据基金名称分类"""
+    def classify_fund(self, fund_name, fund_code=""):
+        """根据基金名称分类，优先使用自定义板块标签"""
         if not fund_name:
             return "未知"
         
-        fund_name = fund_name.upper()  # 转换为大写便于匹配
+        # 优先检查基金代码中是否有自定义板块标签 [板块名称]
+        if fund_code and '[' in fund_code and ']' in fund_code:
+            try:
+                start_idx = fund_code.find('[')
+                end_idx = fund_code.find(']')
+                if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                    custom_category = fund_code[start_idx + 1:end_idx]
+                    if custom_category:
+                        return custom_category
+            except:
+                pass
         
-        # 按优先级排序的板块（更专业的分类顺序）
-        priority_categories = [
-            # 核心科技板块
-            "科技", "半导体", "计算机", "电子", "通信", "人工智能", "机器人",
-            # 新兴产业
-            "新能源", "光伏", "风电", "储能", "新能源汽车", "消费电子",
-            # 传统优势板块
-            "军工", "医药", "消费", "食品饮料", "家电", "汽车",
-            # 金融地产
-            "金融", "地产", "建筑装饰", "建筑材料",
-            # 周期板块
-            "化工", "钢铁", "煤炭", "电力", "机械设备", "电气设备",
-            # 其他板块
-            "农业", "黄金", "港股", "基建", "传媒", "环保", "教育", "物流",
-            "纺织服装", "轻工制造", "公用事业", "交通运输", "商业贸易", "休闲服务", "综合",
-            # 基金类型分类（按专业程度排序）
-            "ETF基金", "LOF基金", "ETF联接", "混合型", "股票型", "债券型", "货币型", "指数型",
-            # 其他分类
-            "场内基金", "其他"
-        ]
+        # 对于境外基金和场内基金，使用简化的关键词自动分类
+        if fund_code and ('.' in fund_code or fund_code in ['015016', '007280', '012060', '012920', '000834', '270042']):
+            fund_name = fund_name.upper()  # 转换为大写便于匹配
+            
+            # 简化的关键词匹配，仅用于境外基金和场内基金
+            if any(keyword in fund_name for keyword in ['科技', 'TMT', '互联网', '通信', '电子']):
+                return "科技"
+            elif any(keyword in fund_name for keyword in ['金融', '银行', '保险', '证券']):
+                return "金融"
+            elif any(keyword in fund_name for keyword in ['医药', '医疗', '生物', '健康']):
+                return "医药"
+            elif any(keyword in fund_name for keyword in ['消费', '食品', '饮料', '白酒']):
+                return "消费"
+            elif any(keyword in fund_name for keyword in ['军工', '国防', '航空', '航天']):
+                return "军工"
+            elif any(keyword in fund_name for keyword in ['新能源', '光伏', '风电', '储能']):
+                return "新能源"
+            elif any(keyword in fund_name for keyword in ['ETF', '指数']):
+                return "ETF基金"
+            else:
+                return "其他"
         
-        # 先检查具体板块
-        for category in priority_categories:
-            if category in self.category_keywords:
-                for keyword in self.category_keywords[category]:
-                    if keyword.upper() in fund_name:
-                        return category
-        
-        # 再检查基金类型
-        for category in ["混合型", "股票型", "债券型", "货币型", "指数型"]:
-            if category in self.category_keywords:
-                for keyword in self.category_keywords[category]:
-                    if keyword.upper() in fund_name:
-                        return category
-        
-        return "其他"
+        # 对于自选基金和监控基金，如果没有自定义标签，返回"未知"
+        return "未知"
     
     def get_category_description(self, category):
         """获取板块描述"""
@@ -187,6 +236,15 @@ class FundCategoryClassifier:
             # 核心科技板块
             "科技": "科技板块",
             "半导体": "半导体板块",
+            # 港股细分板块
+            "港股科技": "港股科技板块",
+            "港股金融": "港股金融板块", 
+            "港股医药": "港股医药板块",
+            "港股": "港股板块",
+            # 金属细分板块
+            "贵金属": "贵金属板块",
+            "有色金属": "有色金属板块",
+            "稀土": "稀土板块",
             "计算机": "计算机板块",
             "电子": "电子板块",
             "通信": "通信板块",
@@ -1246,11 +1304,11 @@ class OptimizedFundTracker:
                 else:
                     return None
                 
-                log_debug(f"正在获取ETF数据: {url}")
+                #log_debug(f"正在获取ETF数据: {url}")
                 response = self.session.get(url, timeout=10)
                 if response.status_code == 200:
                     data = response.json()
-                    log_debug(f"ETF API响应: {data}")
+                    #log_debug(f"ETF API响应: {data}")
                     if data and data.get('rc') == 0:
                         payload = data.get('data') or {}
                         if not payload:
@@ -1436,45 +1494,45 @@ def get_self_selected_funds(max_workers=10):
     """获取自选基金信息 - 优化版本"""
     tracker = OptimizedFundTracker(max_workers=max_workers)
     
-    # 钞钞的基金
+    # 钞钞的基金 - 根据实际持仓数据更新
     chaochao_fund_codes = [
-        "023482",  # 万家创新药
-        "016573",  # 招商银行AH
-        "015740",  # 国泰港股通科技
-        "010364",  # 鹏华军工
-        "013309",  # 易方达恒生科技
-        "018388",  # 华泰柏瑞港股通红利
-        "006113",  # 汇添富创新药混合A
-        "001665",  # 平安鑫安混合
-        "022435",  # 南方中证500
-        "019919",  # 招商中证2000
-        "020902",  # 招商量化选股
-        "021378",  # 兴业港股通互联网
-        "015401",  # 弘毅甄选混合
-        "016814",  # 国联中证煤炭
-        "012341",  # 东财食品饮料指数
-        "020671",  # 易方达科创板芯片
-        "270042",  # 广发纳指100
+        "015740[港股科技]",  # 国泰中证港股通科技ETF发起联接C
+        "018388[港股金融]",  # 华泰柏瑞港股通红利ETF联接基金C
+        "022435[指数型]",  # 南方中证A500ETF联接C
+        "019919[指数型]",  # 招商中证2000指数增强C
+        "021378[港股科技]",  # 兴业中证港股通互联网指数发起式C
+        "016814[传统能源]",  # 国联中证煤炭指数C
+        "012341[食品饮料]",  # 东财食品饮料指数增强C
+        "023037[有色金属]",  # 中欧资源精选混合发起C
+        "015897[化工]",  # 天弘中证细分化工指数发起C
+        "015790[军工]",  # 永赢高端装备智选混合发起C
+        "014669[量化]",  # 银华专精特新量化优选股票发起C
+        "020412[贵金属]",  # 永赢中证沪深港黄金产业股票ETF发起联接C
+        "020900[通信]",  # 天弘中证全指通信设备指数发起C
+        "011036[稀土]",  # 嘉实中证稀土产业ETF联接C
+        "017227[家用电器]",  # 富国中证全指家用电器ETF发起式联接C
+        "015401[机器人]",  # 弘毅远方甄选混合C
+        "011840[人工智能]",  # 天弘中证人工智能C
+        "013172[港股科技]",  # 华夏恒生互联网科技业ETF联接(QDII)C
     ]
     
-    # 垚垚的基金
+    # 垚垚的基金 - 根据实际持仓数据更新
     yaoyao_fund_codes = [
-        "021172",  # 华安北证50A
-        "015945",  # 易方达军工混合
-        "018647",  # 易方达家电龙头
-        "015897",  # 天弘中证化工
-        "012349",  # 天弘恒生科技
-        "013416",  # 永赢医疗器械
-        "002834",  # 华夏锦绣混合
-        "003547",  # 鹏华丰禄债券
-        "021457",  # 易方达红利低波A
-        "012725",  # 国泰畜牧养殖
-        "004253",  # 国泰黄金
-        "016814",  # 国联中证煤炭
-        "015016",  # 华安国际龙头(dax)
-        "007280",  # 摩根日本精选股票
-        "012060",  # 富国全球消费
-        "000834",  # 大成纳斯达克
+        "021172[指数型]",  # 华安北证50成份指数发起式A
+        "015945[军工]",  # 易方达国防军工混合C
+        "015897[化工]",  # 天弘中证细分化工指数发起C
+        "013416[医疗器械]",  # 永赢中证全指医疗器械ETF发起联接C
+        "002834[混合型]",  # 华夏新锦绣混合C
+        "003547[债券型]",  # 鹏华丰禄债券
+        "021457[港股金融]",  # 易方达恒生红利低波ETF联接A
+        "012725[畜牧养殖]",  # 国泰中证畜牧养殖ETF联接C
+        "004253[贵金属]",  # 国泰黄金ETF联接C
+        "013275[传统能源]",  # 富国中证煤炭指数(LOF)C
+        "020608[机器人]",  # 南方中证机器人ETF发起联接C
+        "017193[有色金属]",  # 天弘中证工业有色金属主题指数发起C
+        "024195[通信]",  # 永赢国证商用卫星通信产业ETF发起联接C
+        "017870[消费]",  # 光大消费主题股票C
+        "004070[证券]",  # 南方中证全指证券公司ETF联接C
     ]
     
     # 境外基金（实际可获取的基金代码）
@@ -1521,8 +1579,11 @@ def get_self_selected_funds(max_workers=10):
         "510880.SH",  # 红利ETF
     ]
     
-    # 合并所有基金代码（包括境外基金）
-    my_fund_codes = chaochao_fund_codes + yaoyao_fund_codes + overseas_fund_codes
+    # 合并自选基金代码（不包括境外基金，境外基金单独处理）
+    # 提取纯基金代码，去掉自定义板块标签
+    chaochao_pure_codes = [extract_pure_fund_code(code) for code in chaochao_fund_codes]
+    yaoyao_pure_codes = [extract_pure_fund_code(code) for code in yaoyao_fund_codes]
+    my_fund_codes = chaochao_pure_codes + yaoyao_pure_codes
     
     log_info("=== 自选基金信息 ===")
     log_info(f"🔍 并发请求: {max_workers} 线程")
@@ -1556,7 +1617,15 @@ def get_self_selected_funds(max_workers=10):
         if fund_info:
             fund_code = fund_info.get('fundcode', 'N/A')
             fund_name = fund_info.get('name', 'N/A')
-            category = tracker.classifier.classify_fund(fund_name)
+            
+            # 查找原始基金代码（带自定义标签）
+            original_fund_code = ""
+            for code in chaochao_fund_codes + yaoyao_fund_codes:
+                if code.startswith(fund_code):
+                    original_fund_code = code
+                    break
+            
+            category = tracker.classifier.classify_fund(fund_name, original_fund_code)
             category_desc = tracker.classifier.get_category_description(category)
             
             change_rate = fund_info.get('gszzl', 'N/A')
@@ -1575,9 +1644,9 @@ def get_self_selected_funds(max_workers=10):
             }
             
             # 根据基金代码判断属于哪个组
-            if fund_code in chaochao_fund_codes:
+            if fund_code in chaochao_pure_codes:
                 chaochao_fund_data.append(fund_item)
-            if fund_code in yaoyao_fund_codes:
+            if fund_code in yaoyao_pure_codes:
                 yaoyao_fund_data.append(fund_item)
             if fund_code in overseas_fund_codes:
                 # 境外基金同时添加到两个用户的基金列表中
@@ -1675,11 +1744,11 @@ def get_self_selected_funds(max_workers=10):
     
     # 按原始顺序排序各组基金
     
-    # 按原始顺序排序各组基金
-    chaochao_sorted = sort_by_original_order(chaochao_fund_data, chaochao_fund_codes)
-    yaoyao_sorted = sort_by_original_order(yaoyao_fund_data, yaoyao_fund_codes)
-    overseas_sorted = sort_by_original_order(overseas_fund_data, overseas_fund_codes)
-    etf_sorted = sort_by_original_order(etf_fund_data, etf_fund_codes)
+    # 按板块分类排序各组基金
+    chaochao_sorted = sort_funds_by_category(chaochao_fund_data)
+    yaoyao_sorted = sort_funds_by_category(yaoyao_fund_data)
+    overseas_sorted = sort_funds_by_category(overseas_fund_data)
+    etf_sorted = sort_funds_by_category(etf_fund_data)
     
     # 合并所有基金数据到 'all' 键，确保没有重复
     all_funds = []
@@ -1718,95 +1787,93 @@ def get_monitor_funds(max_workers=10):
     
     monitor_fund_codes = [
         #军工
-        "010364",  # 鹏华军工
-        "022243",  # 中邮军工混合
-        "012842",  # 易方达军工
-        "015945",  # 易方达军工混合
-        "013566",  # 华夏军工混合
+        "010364[军工]",  # 鹏华军工
+        "022243[军工]",  # 中邮军工混合
+        "012842[军工]",  # 易方达军工
+        "015945[军工]",  # 易方达军工混合
+        "013566[军工]",  # 华夏军工混合
         #黄金
-        "021959",  # 南方沪深港黄金
-        "020412",  # 永赢沪深港黄金
-        "004253",  # 国泰黄金
+        "021959[贵金属]",  # 南方沪深港黄金
+        "020412[贵金属]",  # 永赢沪深港黄金
         #医疗
-        "006113",  # 汇添富创新药混合A
-        "023482",  # 万家港股创新药
-        "017633",  # 汇添富医疗器械
-        "024380",  # 平安港股通医疗混合
-        "013416",  # 永赢医疗器械
-        "014565",  # 天弘沪深港创新药
-        "020398",  # 中银医药混合
-        "021760",  # 中欧港股创新药
+        "006113[港股医疗]",  # 汇添富创新药混合A
+        "023482[港股医疗]",  # 万家港股创新药
+        "017633[医疗器械]",  # 汇添富医疗器械
+        "024380[港股医疗]",  # 平安港股通医疗混合
+        "013416[医疗器械]",  # 永赢医疗器械
+        "014565[港股医疗]",  # 天弘沪深港创新药
         #银行
-        "016573",  # 招商银行AH
-        "021457",  # 易方达红利低波A
-        "018388",  # 华泰柏瑞港股通红利
-        "019026",  # 易方达金融股票
-        "006810",  # 泰康香港银行
+        "016573[金融]",  # 招商银行AH
+        "021457[港股金融]",  # 易方达红利低波A
+        "018388[港股金融]",  # 华泰柏瑞港股通红利
+        "019026[金融]",  # 易方达金融股票
+        "006810[港股金融]",  # 泰康香港银行
         #通信
-        "022365",  # 永赢智选混合
-        "004409",  # 招商TMT
-        "022500",  # 国泰全指通信ETF
-        "021717",  # 招商云计算ETF
-        "019170",  # 天弘沪港深云计算
-        "014819",  # 国金新兴价值混合
-        "020671",  # 易方达科创板芯片
-        "014422",  # 弘毅消费混合
-        "018994",  # 中欧数字经济混合
-        "021989",  # 银河中证通信
-        "023385",  # 平安人工智能
+        "022365[通信]",  # 永赢智选混合
+        "004409[通信]",  # 招商TMT
+        "022500[通信]",  # 国泰全指通信ETF
+        "021717[云计算]",  # 招商云计算ETF
+        "019170[云计算]",  # 天弘沪港深云计算
+        "014819[科技]",  # 国金新兴价值混合
+        "020671[半导体]",  # 易方达科创板芯片
+        "014422[科技]",  # 弘毅消费混合
+        "018994[通信]",  # 中欧数字经济混合
+        "021989[通信]",  # 银河中证通信
+        "023385[人工智能]",  # 平安人工智能
         #机器人
-        "020256",  # 中欧机器人
-        "020973",  # 易方达机器人
-        "015401",  # 弘毅甄选混合
-        "018125",  # 永赢制造混合
+        "020256[机器人]",  # 中欧机器人
+        "020973[机器人]",  # 易方达机器人
+        "015401[机器人]",  # 弘毅甄选混合
+        "018125[机器人]",  # 永赢制造混合
         #量化
-        "014806",  # 国金量化混合
-        "020902",  # 招商量化选股
+        "014806[量化]",  # 国金量化混合
+        "020902[量化]",  # 招商量化选股
         #新能源
-        "017647",  # 易方达光伏
-        "015528",  # 弘毅汽车混合
+        "017647[新能源]",  # 易方达光伏
+        "015528[新能源汽车]",  # 弘毅汽车混合
         #传统能源
-        "016814",  # 国联中证煤炭
-        "015897",  # 天弘中证化工
-        "019590",  # 东财化工C
-        "018647",  # 易方达家电龙头
-        "011036",  # 嘉实中证稀土
-        "012725",  # 国泰畜牧养殖
-        "012341",  # 东财食品饮料指数
+        "016814[传统能源]",  # 国联中证煤炭
+        "015897[化工]",  # 天弘中证化工
+        "018647[家用电器]",  # 易方达家电龙头
+        "011036[有色金属]",  # 嘉实中证稀土
+        "012725[畜牧养殖]",  # 国泰畜牧养殖
+        "012341[消费]",  # 东财食品饮料指数
         #半导体
-        "012651",  # 博时半导体
-        "019571",  # 诺安配置混合
-        "001665",  # 平安鑫安混合
-        "014855",  # 嘉实中证半导体
+        "012651[半导体]",  # 博时半导体
+        "019571[半导体]",  # 诺安配置混合
+        "001665[半导体]",  # 平安鑫安混合
+        "014855[半导体]",  # 嘉实中证半导体
         #指数
-        "022435",  # 南方中证500
-        "019919",  # 招商中证2000
-        "021172",  # 华安北证50A
-        "001593",  # 天弘创业板ETF
+        "022435[指数型]",  # 南方中证500
+        "019919[指数型]",  # 招商中证2000
+        "021172[指数型]",  # 华安北证50A
+        "001593[指数型]",  # 天弘创业板ETF
         #基建
-        "004857",  # 广发建筑材料
+        "004857[建筑材料]",  # 广发建筑材料
         #港股通科技
-        "015740",  # 国泰港股通科技
-        "013309",  # 易方达恒生科技
-        "012349",  # 天弘恒生科技
-        "024535",  # 平安港股通混合
-        "021378",  # 兴业港股通互联网
-        "013172",  # 华夏恒生互联网
+        "015740[港股科技]",  # 国泰港股通科技
+        "013309[港股科技]",  # 易方达恒生科技
+        "012349[港股科技]",  # 天弘恒生科技
+        "021378[港股科技]",  # 兴业港股通互联网
+        "013172[港股科技]",  # 华夏恒生互联网
         #灵活混合
-        "002834",  # 华夏锦绣混合
+        "002834[混合型]",  # 华夏锦绣混合
         #债基
-        "003547",  # 鹏华丰禄债券
-        "018598",  # 兴全招益债券
+        "003547[债券型]",  # 鹏华丰禄债券
+        "018598[债券型]",  # 兴全招益债券
     ]
+    
+    # 提取纯基金代码，去掉自定义板块标签
+    monitor_pure_codes = [extract_pure_fund_code(code) for code in monitor_fund_codes]
     
     log_info("=== 监控基金信息 ===")
     log_info(f"🔍 并发请求: {max_workers} 线程")
     
     start_time = time.time()
-    fund_data_raw = tracker.get_funds_realtime(monitor_fund_codes)
+    fund_data_raw = tracker.get_funds_realtime(monitor_pure_codes)
     end_time = time.time()
     
-    log_info(f"⏱️  耗时: {end_time - start_time:.1f}s, 成功: {len(fund_data_raw)}/{len(monitor_fund_codes)} 只")
+    log_info(f"⏱️  耗时: {end_time - start_time:.1f}s, 成功: {len(fund_data_raw)}/{len(monitor_pure_codes)} 只")
     
     # 转换数据格式
     monitor_fund_data = []
@@ -1814,7 +1881,15 @@ def get_monitor_funds(max_workers=10):
         if fund_info:
             fund_code = fund_info.get('fundcode', 'N/A')
             fund_name = fund_info.get('name', 'N/A')
-            category = tracker.classifier.classify_fund(fund_name)
+            
+            # 查找原始基金代码（带自定义标签）
+            original_fund_code = ""
+            for code in monitor_fund_codes:
+                if extract_pure_fund_code(code) == fund_code:
+                    original_fund_code = code
+                    break
+            
+            category = tracker.classifier.classify_fund(fund_name, original_fund_code)
             
             fund_item = {
                 "基金代码": fund_code,
@@ -1828,8 +1903,8 @@ def get_monitor_funds(max_workers=10):
             }
             monitor_fund_data.append(fund_item)
     
-    # 按原始顺序排序基金
-    sorted_monitor_funds = sort_by_original_order(monitor_fund_data, monitor_fund_codes)
+    # 按板块分类排序基金
+    sorted_monitor_funds = sort_funds_by_category(monitor_fund_data)
     
     return sorted_monitor_funds
 
@@ -2109,7 +2184,7 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None):
         .category-煤炭 {{
             background-color: #5d4037;
         }}
-        .category-电力 {{
+        .category-电力 {{background-
             background-color: #4e342e;
         }}
         .category-机械设备 {{
@@ -2123,12 +2198,90 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None):
         .category-农业 {{
             background-color: #00897b;
         }}
-        .category-黄金 {{
-            background-color: #b58900;
-            color: #fff;
-        }}
         .category-港股 {{
             background-color: #006064;
+        }}
+        /* 港股细分板块 - 与对应板块颜色保持一致 */
+        .category-港股科技 {{
+            background-color: #1565c0;  /* 与科技板块一致 */
+        }}
+        .category-港股金融 {{
+            background-color: #6a1b9a;  /* 与金融板块一致 */
+        }}
+        .category-港股医药 {{
+            background-color: #d32f2f;  /* 与医药板块一致 */
+        }}
+        
+        /* 金属细分板块 - 金色系渐变 */
+        .category-贵金属 {{
+            background-color: #b58900;  /* 金色 */
+            color: #fff;
+        }}
+        .category-有色金属 {{
+            background-color: #cd7f32;  /* 铜色 */
+            color: #fff;
+        }}
+        .category-稀土 {{
+            background-color: #b8860b;  /* 暗金色 */
+            color: #fff;
+        }}
+        
+        /* 新增自定义板块样式 */
+        .category-传统能源 {{
+            background-color: #5d4037;  /* 深棕色 */
+            color: #fff;
+        }}
+        .category-食品饮料 {{
+            background-color: #f57c00;  /* 橙色 */
+            color: #fff;
+        }}
+        .category-医疗器械 {{
+            background-color: #e91e63;  /* 粉红色 */
+            color: #fff;
+        }}
+        .category-混合型 {{
+            background-color: #546e7a;  /* 蓝灰色 */
+            color: #fff;
+        }}
+        .category-债券型 {{
+            background-color: #1b5e20;  /* 深绿色 */
+            color: #fff;
+        }}
+        .category-指数型 {{
+            background-color: #00695c;  /* 深青色 */
+            color: #fff;
+        }}
+        .category-量化 {{
+            background-color: #37474f;  /* 深灰色 */
+            color: #fff;
+        }}
+        .category-通信 {{
+            background-color: #42a5f5;  /* 浅蓝色 */
+            color: #fff;
+        }}
+        .category-家用电器 {{
+            background-color: #ff8f00;  /* 深橙色 */
+            color: #fff;
+        }}
+        .category-畜牧养殖 {{
+            background-color: #8bc34a;  /* 浅绿色 */
+            color: #2e7d32;
+        }}
+        .category-证券 {{
+            background-color: #9c27b0;  /* 紫色 */
+            color: #fff;
+        }}
+        .category-云计算 {{
+            background-color: #03a9f4;  /* 天蓝色 */
+            color: #fff;
+        }}
+        .category-新能源汽车 {{
+            background-color: #81c784;  /* 浅绿色 */
+            color: #2e7d32;
+        }}
+        .category-港股医疗 {{
+            background-color: #d32f2f;  /* 与医药板块一致 */
+            color: #fff;
         }}
         .category-基建 {{
             background-color: #795548;
@@ -3612,22 +3765,40 @@ def _clean_remote_url(remote_url):
     return remote_url
 
 def update_github_pages(html_filename):
-    """更新GitHub Pages的index.html和.nojekyll文件，以本地为准直接覆盖仓库文件"""
+    """更新GitHub Pages的index.html和.nojekyll文件，先更新到fund_tool_clean文件夹，再推送"""
     try:
         import os
         import subprocess
+        import shutil
         
-        # 复制最新的HTML文件为index.html
+        # 检查fund_tool_clean文件夹是否存在
+        clean_folder = '../fund_tool_clean'
+        if not os.path.exists(clean_folder):
+            print(f"❌ 未找到 {clean_folder} 文件夹，请先创建该文件夹")
+            return False
+        
+        print(f"📁 正在更新 {clean_folder} 文件夹...")
+        
+        # 复制最新的HTML文件到fund_tool_clean文件夹
         if os.path.exists(html_filename):
-            import shutil
-            shutil.copy2(html_filename, 'index.html')
-            print(f"✓ 已更新 index.html（从 {html_filename}）")
+            clean_html_path = os.path.join(clean_folder, 'index.html')
+            shutil.copy2(html_filename, clean_html_path)
+            print(f"✓ 已更新 {clean_html_path}（从 {html_filename}）")
+        else:
+            print(f"❌ 源文件 {html_filename} 不存在")
+            return False
         
-        # 创建.nojekyll文件（如果不存在）
-        if not os.path.exists('.nojekyll'):
-            with open('.nojekyll', 'w') as f:
+        # 在fund_tool_clean文件夹中创建.nojekyll文件
+        nojekyll_path = os.path.join(clean_folder, '.nojekyll')
+        if not os.path.exists(nojekyll_path):
+            with open(nojekyll_path, 'w') as f:
                 pass
-            print("✓ 已创建 .nojekyll 文件")
+            print(f"✓ 已创建 {nojekyll_path} 文件")
+        
+        # 切换到fund_tool_clean文件夹进行推送
+        original_dir = os.getcwd()
+        os.chdir(clean_folder)
+        print(f"📂 已切换到 {clean_folder} 目录")
         
         # 检查是否在git仓库中
         try:
@@ -3643,16 +3814,17 @@ def update_github_pages(html_filename):
                 except:
                     print("ℹ️ Git用户信息配置跳过（可能已配置）")
                 
-                # 选择性推送：只推送必要的文件，避免敏感信息检测
-                print("🔄 选择性推送：只推送必要文件...")
+                # 处理可能的文件冲突：以本地为准，强制覆盖
+                print("🔄 处理文件冲突：以本地为准...")
                 try:
-                    # 只添加必要的文件，避免推送整个代码库
-                    subprocess.run(['git', 'add', 'index.html', '.nojekyll'], check=True, capture_output=True)
-                    print("✓ 已添加必要文件到暂存区（index.html, .nojekyll）")
+                    # 强制添加所有本地更改，确保本地文件被包含
+                    subprocess.run(['git', 'add', '.'], check=True, capture_output=True)
+                    print("✓ 已添加所有本地更改到暂存区")
                 except:
                     print("ℹ️ Git添加跳过（可能无更改）")
                 
-                print("📁 只推送必要文件，避免敏感信息检测...")
+                # 添加文件到暂存区（已经在上一步添加了所有文件，这里可以跳过）
+                print("📁 文件已添加到Git暂存区...")
                 
                 # 提交更改
                 commit_message = f'Update fund report - {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
@@ -3707,8 +3879,8 @@ def update_github_pages(html_filename):
                             print("💪 尝试强制推送（以本地为准）...")
                             subprocess.run(['git', 'push', '--force-with-lease', 'origin', 'main'], check=True, timeout=60)
                             print("✅ 强制推送成功！")
-                                    print("🌐 GitHub Pages访问地址: https://SevenKale.github.io/fund-report/")
-                                    return True
+                            print("🌐 GitHub Pages访问地址: https://SevenKale.github.io/fund-report/")
+                            return True
                         except subprocess.CalledProcessError as e3:
                             print(f"⚠️ 强制推送失败: {e3}")
                         
@@ -3736,11 +3908,21 @@ def update_github_pages(html_filename):
         except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError) as e:
             print(f"ℹ️  Git操作失败: {e}")
             print("💡 已更新本地文件，请手动推送到GitHub")
+        
+        # 切换回原目录
+        os.chdir(original_dir)
+        print(f"📂 已切换回原目录: {original_dir}")
             
     except Exception as e:
         print(f"⚠️  更新GitHub Pages时出错: {e}")
         import traceback
         traceback.print_exc()
+        # 确保切换回原目录
+        try:
+            os.chdir(original_dir)
+            print(f"📂 已切换回原目录: {original_dir}")
+        except:
+            pass
     
     return False
 
@@ -3889,13 +4071,17 @@ def main():
             if holdings_data:
                 # 验证持仓数据与基金数据的匹配性
                 if not calculator.validate_holdings_data(holdings_data, self_selected_dict):
-                    print("⚠️  持仓数据与基金数据不匹配，正在更新持仓数据...")
-                    holdings_data = calculator.update_holdings_data()
+                    print("❌  持仓数据与基金数据不匹配，请检查持仓数据文件！")
+                    print("⚠️  跳过持仓收益计算，继续生成报告...")
+                    holdings_data = None
                 
-                profit_results = calculator.calculate_holdings_profit(holdings_data, self_selected_dict)
-                # 将持仓收益信息添加到基金数据中（仅自选基金）
-                self_selected_dict = calculator.enhance_fund_data_with_holdings(self_selected_dict, profit_results)
-                log_info("✅ 持仓信息已添加到自选基金数据中")
+                if holdings_data:
+                    profit_results = calculator.calculate_holdings_profit(holdings_data, self_selected_dict)
+                    # 将持仓收益信息添加到基金数据中（仅自选基金）
+                    self_selected_dict = calculator.enhance_fund_data_with_holdings(self_selected_dict, profit_results)
+                    log_info("✅ 持仓信息已添加到自选基金数据中")
+                else:
+                    log_info("⚠️  由于持仓数据不匹配，跳过持仓收益计算")
             else:
                 print("⚠️  未能加载持仓数据")
         except Exception as e:
@@ -3919,11 +4105,11 @@ def main():
             try:
                 ur = profit_results.get(user_key, {})
                 return (
-                    f"{user_label}的持仓:\n"
-                    f"总投入:{ur.get('total_cost', 0):,.2f}\n"
-                    f"当前市值:{ur.get('total_current_value', 0):,.2f}\n"
-                    f"总收益:{ur.get('total_profit', 0):,.2f}({ur.get('total_profit_rate', 0):+,.2f}%)\n"
-                    f"今日收益:{ur.get('today_profit', 0):,.2f}({ur.get('today_profit_rate', 0):+,.2f}%)"
+                    f"{user_label}的持仓: "
+                    f"投入:{ur.get('total_cost', 0):,.0f} "
+                    f"市值:{ur.get('total_current_value', 0):,.0f} "
+                    f"总收益:{ur.get('total_profit', 0):,.0f}({ur.get('total_profit_rate', 0):+.1f}%) "
+                    f"今日:{ur.get('today_profit', 0):,.0f}({ur.get('today_profit_rate', 0):+.1f}%)"
                 )
             except Exception:
                 return f"{user_label}的持仓:数据不足"
@@ -3949,9 +4135,8 @@ def main():
             
             log_info(f"📈 监控基金: {monitor_avg:+.2f}% (↑{monitor_up} ↓{monitor_down} →{monitor_flat})")
         
-        # 按板块分析
-        analyze_by_category(self_selected_dict['all'])
-        log_info("\n=== 监控基金板块分析 ===")
+        # 按板块分析（仅分析监控基金）
+        log_info("\n=== 板块分析 ===")
         analyze_by_category(monitor_funds)
         
         # 移除重复的持仓收益计算日志块（已在前面完成计算与渲染），避免双重输出
