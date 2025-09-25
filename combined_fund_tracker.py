@@ -34,26 +34,26 @@ def sort_funds_by_category(fund_list):
     # 定义板块优先级顺序
     category_priority = {
         # 港股板块
-        "港股": 1,
+        "港股": 1,"港股科技": 2, "科技": 3,"港股金融": 4,"金融": 5,"港股医药": 6, "医药": 7, "医疗器械": 8,
         # 核心科技板块
-        "港股科技": 2, "科技": 3, "半导体": 4, "计算机": 5, "电子": 6, "通信": 7, "人工智能": 8, "机器人": 9,
+         "半导体": 9, "计算机": 10, "电子": 11, "通信": 12, "人工智能": 13, "机器人": 14,"消费电子": 15,
         # 金融地产
-        "港股金融": 10,"金融": 11, "地产": 12, "建筑装饰": 13, "建筑材料": 14,
+         "地产": 16, "建筑装饰": 17, "建筑材料": 18,
         # 新兴产业
-        "新能源": 15, "光伏": 16, "风电": 17, "储能": 18, "新能源汽车": 19, "消费电子": 20,
+        "新能源": 19, "光伏": 20, "风电": 21, "储能": 22, "新能源汽车": 23, "汽车": 24,
         # 传统优势板块
-        "军工": 21,  "港股医药": 22, "医药": 23, "消费": 24, "食品饮料": 25, "家电": 26, "汽车": 27,
+        "军工": 25,   "消费": 26, "食品饮料": 27, "家电": 28, 
         # 金属细分板块
-        "贵金属": 28, "有色金属": 29, "稀土": 30, 
+        "贵金属": 29, "有色金属": 30, "稀土": 31, 
         # 周期板块
-        "化工": 31, "钢铁": 32, "煤炭": 33, "电力": 34, "机械设备": 35, "电气设备": 36,
+        "化工": 32, "钢铁": 33, "煤炭": 34, "传统能源": 35, "电力": 36, "机械设备": 37, "电气设备": 38,
         # 其他板块
-        "农业": 37, "基建": 38, "传媒": 39, "环保": 40, "教育": 41, "物流": 42,
-        "纺织服装": 43, "轻工制造": 44, "公用事业": 45, "交通运输": 46, "商业贸易": 47, "休闲服务": 48, "综合": 49,
+        "农业": 39, "基建": 40, "传媒": 41, "环保": 42, "教育": 43, "物流": 44,
+        "纺织服装": 45, "轻工制造": 46, "公用事业": 47, "交通运输": 48, "商业贸易": 49, "休闲服务": 50, "综合": 51,
         # 基金类型分类
-        "ETF基金": 50, "LOF基金": 51, "ETF联接": 52, "混合型": 53, "股票型": 54, "债券型": 55, "货币型": 56, "指数型": 57,
+        "ETF基金": 52, "LOF基金": 53, "ETF联接": 54, "混合型": 55, "股票型": 56, "债券型": 57, "货币型": 58, "指数型": 59,
         # 其他分类
-        "场内基金": 58, "其他": 59, "未知": 60
+        "场内基金": 60, "其他": 61, "未知": 62
     }
     
     def get_category_priority(fund):
@@ -437,6 +437,8 @@ class HoldingsProfitCalculator:
                     
                     holdings.append(holding)
                 
+                # 按持仓成本降序排序，重仓基金在前
+                holdings.sort(key=lambda x: x['cost_amount'], reverse=True)
                 holdings_data[sheet_name] = holdings
             
             log_info(f"✓ 已加载持仓文件: {filename}")
@@ -908,7 +910,7 @@ tr:hover {{
             log_info(f"备份持仓数据失败: {e}")
             return False
     
-    def update_holdings_from_trading_data(self, holdings_data, trading_data, fund_nav_data):
+    def update_holdings_from_trading_data(self, holdings_data, trading_data, fund_nav_data, fund_data_dict=None):
         """根据交易数据更新持仓信息"""
         try:
             # 先备份原始数据
@@ -918,6 +920,18 @@ tr:hover {{
             
             updated_holdings = {}
             cleared_funds = set()  # 记录需要清仓的基金
+            
+            # 创建基金代码到基金名称的映射，用于更新基金名称
+            fund_name_map = {}
+            if fund_data_dict:
+                for user_key in ['chaochao', 'yaoyao', 'all']:
+                    if user_key in fund_data_dict:
+                        for fund in fund_data_dict[user_key]:
+                            fund_code = fund.get('基金代码', '')
+                            fund_name = fund.get('基金名称', '')
+                            if fund_code and fund_name:
+                                fund_name_map[fund_code] = fund_name
+                log_info(f"📋 交易更新时基金名称映射表包含 {len(fund_name_map)} 个基金")
             
             for user, holdings in holdings_data.items():
                 updated_holdings[user] = []
@@ -929,7 +943,11 @@ tr:hover {{
                         continue
                     
                     fund_code = str(trade['fund_code']).zfill(6)
-                    fund_name = trade.get('fund_name', '')
+                    # 使用最新的基金名称，如果找不到则使用交易数据中的名称
+                    old_fund_name = trade.get('fund_name', '')
+                    fund_name = fund_name_map.get(fund_code, old_fund_name)
+                    if fund_name != old_fund_name and old_fund_name:
+                        log_info(f"✓ {user} 交易操作中更新基金名称: {fund_code} {old_fund_name} -> {fund_name}")
                     shares = float(trade.get('shares', 0))
                     cost_price = float(trade.get('cost_price', 0))
                     cost_amount = float(trade.get('cost_amount', 0))
@@ -1063,10 +1081,15 @@ tr:hover {{
                 # 添加未清仓的基金（保留变更字段但清空数据）
                 for fund_code, holding in user_holdings.items():
                     if (user, fund_code) not in cleared_funds:
+                        # 获取最新的基金名称
+                        latest_fund_name = fund_name_map.get(fund_code, holding['fund_name'])
+                        if latest_fund_name != holding['fund_name']:
+                            log_info(f"✓ {user} 更新基金名称: {fund_code} {holding['fund_name']} -> {latest_fund_name}")
+                        
                         # 创建新的持仓记录，保留所有字段但清空操作数据
                         clean_holding = {
                             'fund_code': holding['fund_code'],
-                            'fund_name': holding['fund_name'],
+                            'fund_name': latest_fund_name,  # 使用最新的基金名称
                             'shares': round(holding['shares'], 2),  # 保留2位小数
                             'cost_price': round(holding['cost_price'], 4),  # 保留4位小数
                             'cost_amount': round(holding['cost_amount'], 2),  # 保留2位小数
@@ -1078,6 +1101,9 @@ tr:hover {{
                             'convert_ratio': 1
                         }
                         updated_holdings[user].append(clean_holding)
+                
+                # 按持仓成本降序排序，重仓基金在前
+                updated_holdings[user].sort(key=lambda x: x['cost_amount'], reverse=True)
             
             # 保存更新后的持仓数据
             self.save_updated_holdings(updated_holdings)
@@ -1100,6 +1126,70 @@ tr:hover {{
             return True
         except Exception as e:
             log_info(f"保存更新后的持仓数据失败: {e}")
+            return False
+    
+    def update_fund_names_in_holdings(self, holdings_data, fund_data_dict, filename='holdings_data.xlsx', verbose=True):
+        """更新持仓文件中的基金名称"""
+        try:
+            if not fund_data_dict:
+                if verbose:
+                    log_info("⚠️ 没有基金数据，跳过基金名称更新")
+                return False
+            
+            # 创建基金代码到基金名称的映射
+            fund_name_map = {}
+            for user_key in ['chaochao', 'yaoyao', 'all']:
+                if user_key in fund_data_dict:
+                    for fund in fund_data_dict[user_key]:
+                        fund_code = fund.get('基金代码', '')
+                        fund_name = fund.get('基金名称', '')
+                        if fund_code and fund_name:
+                            fund_name_map[fund_code] = fund_name
+            
+            if verbose:
+                log_info(f"📋 基金名称映射表包含 {len(fund_name_map)} 个基金")
+            
+            if not fund_name_map:
+                if verbose:
+                    log_info("⚠️ 没有找到有效的基金名称映射")
+                return False
+            
+            # 基金名称更新不需要单独备份，因为后续交易操作会统一备份
+            
+            updated_holdings = {}
+            name_updated_count = 0
+            
+            for user, holdings in holdings_data.items():
+                updated_holdings[user] = []
+                for holding in holdings:
+                    fund_code = holding['fund_code']
+                    old_name = holding['fund_name']
+                    new_name = fund_name_map.get(fund_code, old_name)
+                    
+                    if new_name != old_name:
+                        if verbose:
+                            log_info(f"✓ {user} 更新基金名称: {fund_code} {old_name} -> {new_name}")
+                        name_updated_count += 1
+                        holding['fund_name'] = new_name
+                    
+                    updated_holdings[user].append(holding)
+                
+                # 按持仓成本降序排序
+                updated_holdings[user].sort(key=lambda x: x['cost_amount'], reverse=True)
+            
+            if name_updated_count > 0:
+                # 保存更新后的持仓数据
+                self.save_updated_holdings(updated_holdings, filename)
+                if verbose:
+                    log_info(f"✓ 已更新 {name_updated_count} 个基金名称")
+                return True
+            else:
+                if verbose:
+                    log_info("✓ 所有基金名称都是最新的，无需更新")
+                return True
+                
+        except Exception as e:
+            log_info(f"更新基金名称失败: {e}")
             return False
 
 class OptimizedFundTracker:
@@ -1750,7 +1840,6 @@ def get_self_selected_funds(max_workers=10):
         "018388[港股金融]",  # 华泰柏瑞港股通红利ETF联接基金C
         "022435[指数型]",  # 南方中证A500ETF联接C
         "019919[指数型]",  # 招商中证2000指数增强C
-        "021378[港股科技]",  # 兴业中证港股通互联网指数发起式C
         "016814[传统能源]",  # 国联中证煤炭指数C
         "012341[食品饮料]",  # 东财食品饮料指数增强C
         "023037[有色金属]",  # 中欧资源精选混合发起C
@@ -1834,7 +1923,10 @@ def get_self_selected_funds(max_workers=10):
     # 提取纯基金代码，去掉自定义板块标签
     chaochao_pure_codes = [extract_pure_fund_code(code) for code in chaochao_fund_codes]
     yaoyao_pure_codes = [extract_pure_fund_code(code) for code in yaoyao_fund_codes]
-    my_fund_codes = chaochao_pure_codes + yaoyao_pure_codes
+    
+    # 合并所有基金代码并去重
+    all_pure_codes = chaochao_pure_codes + yaoyao_pure_codes
+    my_fund_codes = list(set(all_pure_codes))  # 去重
     
     log_info("=== 自选基金信息 ===")
     log_info(f"🔍 并发请求: {max_workers} 线程")
@@ -2039,7 +2131,7 @@ def get_monitor_funds(max_workers=10):
         #军工
         "010364[军工]",  # 鹏华军工
         "022243[军工]",  # 中邮军工混合
-        "012842[军工]",  # 易方达军工
+        "015790[军工]",  # 永赢高端装备智选混合发起C
         "015945[军工]",  # 易方达军工混合
         "013566[军工]",  # 华夏军工混合
         #黄金
@@ -2689,8 +2781,8 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None):
         }}
         .chart-container {{
             position: relative;
-            height: 500px;
-            margin: 16px 0 8px;
+            height: 450px;
+            margin: 20px 0 4px;
             width: 100%;
             background-color: #f8f9fa;
             border-radius: 8px;
@@ -2713,9 +2805,59 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None):
         }}
         .modal-title {{
             color: #333333;
-            margin-bottom: 30px;
+            margin-bottom: 20px;
             text-align: center;
             font-size: 24px;
+        }}
+        .fund-info-card {{
+            background: rgba(255,255,255,0.95);
+            color: #333;
+            padding: 12px 16px;
+            border-radius: 12px;
+            margin: 12px 0;
+            border: 1px solid rgba(0,123,255,0.3);
+            box-shadow: 0 4px 20px rgba(0,123,255,0.15);
+        }}
+        .info-row {{
+            margin: 8px 0;
+            display: flex;
+            justify-content: flex-start;
+            align-items: center;
+            padding: 4px 0;
+            gap: 20px;
+        }}
+        .info-item {{
+            flex: 1;
+            text-align: left;
+        }}
+        .info-label {{
+            color: #666;
+            font-size: 14px;
+            font-weight: 500;
+        }}
+        .info-value {{
+            color: #333;
+            font-weight: bold;
+            font-size: 14px;
+        }}
+        .nav-value {{
+            color: #007bff;
+            font-size: 16px;
+            font-weight: bold;
+        }}
+        .cost-value {{
+            color: #ff6b6b;
+            font-size: 14px;
+            font-weight: bold;
+        }}
+        .info-value.positive {{
+            color: #dc3545;
+        }}
+        .info-value.negative {{
+            color: #28a745;
+        }}
+        .info-value.neutral {{
+            color: #6c757d;
         }}
         .range-buttons {{
             display: flex;
@@ -2815,6 +2957,30 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None):
                     <div class="legend">
                         <span class="legend-item"><span class="legend-line price"></span>净价</span>
                         <span class="legend-item"><span class="legend-line cost"></span>成本单价</span>
+                    </div>
+                </div>
+                
+                <!-- 信息显示区域：日期选择按钮下方，图表区域上方 -->
+                <div class="fund-info-card">
+                    <div class="info-row">
+                        <div class="info-item">
+                            <span class="info-label">交易日期:</span>
+                            <span class="info-value" id="transactionDate">-</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label">单位净值:</span>
+                            <span class="nav-value" id="unitNav">-</span>
+                        </div>
+                    </div>
+                    <div class="info-row">
+                        <div class="info-item">
+                            <span class="info-label">涨跌幅:</span>
+                            <span class="info-value" id="changeRate">-</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label">持仓成本:</span>
+                            <span class="cost-value" id="holdingCost">-</span>
+                        </div>
                     </div>
                 </div>
                 <div class="chart-container">
@@ -3138,12 +3304,12 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None):
             
             // 清空容器
             chartContainer.innerHTML = '';
-            // 创建 tooltip 容器
-            var tooltip = document.createElement('div');
-            tooltip.className = 'tooltip';
-            tooltip.style.display = 'none';
-            document.body.appendChild(tooltip);
             
+            // 创建动态坐标轴标签容器
+            var xAxisLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+            var yAxisLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+            
+
             // X轴标签稀疏显示：优先显示每月1日；若无，则显示每月15日；否则按间隔抽样
             var labels = [];
             var labelIndices = [];
@@ -3272,17 +3438,29 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None):
             path.setAttribute('stroke-linejoin', 'round');
             svg.appendChild(path);
             
-            // 悬浮虚线与提示
-            var hoverLine = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-            hoverLine.setAttribute('x1', paddingLeft);
-            hoverLine.setAttribute('y1', paddingTop);
-            hoverLine.setAttribute('x2', paddingLeft);
-            hoverLine.setAttribute('y2', height - paddingBottom);
-            hoverLine.setAttribute('stroke', '#999');
-            hoverLine.setAttribute('stroke-width', '1.5');
-            hoverLine.setAttribute('stroke-dasharray', '5,5');
-            hoverLine.style.opacity = 0;
-            svg.appendChild(hoverLine);
+            // 悬浮垂直虚线
+            var hoverVerticalLine = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+            hoverVerticalLine.setAttribute('x1', paddingLeft);
+            hoverVerticalLine.setAttribute('y1', paddingTop);
+            hoverVerticalLine.setAttribute('x2', paddingLeft);
+            hoverVerticalLine.setAttribute('y2', height - paddingBottom);
+            hoverVerticalLine.setAttribute('stroke', '#007bff');
+            hoverVerticalLine.setAttribute('stroke-width', '1.5');
+            hoverVerticalLine.setAttribute('stroke-dasharray', '5,5');
+            hoverVerticalLine.style.opacity = 0;
+            svg.appendChild(hoverVerticalLine);
+            
+            // 悬浮水平虚线
+            var hoverHorizontalLine = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+            hoverHorizontalLine.setAttribute('x1', paddingLeft);
+            hoverHorizontalLine.setAttribute('y1', paddingTop);
+            hoverHorizontalLine.setAttribute('x2', width - paddingRight);
+            hoverHorizontalLine.setAttribute('y2', paddingTop);
+            hoverHorizontalLine.setAttribute('stroke', '#007bff');
+            hoverHorizontalLine.setAttribute('stroke-width', '1.5');
+            hoverHorizontalLine.setAttribute('stroke-dasharray', '5,5');
+            hoverHorizontalLine.style.opacity = 0;
+            svg.appendChild(hoverHorizontalLine);
             
             // 如果有成本价，添加水平虚线
             if (costPrice && costPrice !== 'N/A') {{
@@ -3299,8 +3477,6 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None):
                         costLine.setAttribute('stroke-width', '2');
                         costLine.setAttribute('stroke-dasharray', '5,5');
                         svg.appendChild(costLine);
-                        
-                        // 取消右侧成本价文字显示（仅保留虚线与悬浮提示）
                     }}
                 }} catch (e) {{
                     console.log('成本价解析失败:', e);
@@ -3342,46 +3518,207 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None):
             title.textContent = titleLabel || '净值走势';
             svg.appendChild(title);
 
-            // 悬浮交互（提示字体更大，成本价与虚线一致颜色）
+            // 悬浮交互（动态显示虚线）
             svg.addEventListener('mouseleave', function() {{
-                hoverLine.style.opacity = 0;
-                tooltip.style.display = 'none';
+                hoverVerticalLine.style.opacity = 0;
+                hoverHorizontalLine.style.opacity = 0;
+                xAxisLabel.style.opacity = 0;
+                yAxisLabel.style.opacity = 0;
+                
+                // 移除圆标记
+                var existingCircle = svg.querySelector('.hover-circle');
+                if (existingCircle) {{
+                    svg.removeChild(existingCircle);
+                }}
+                
+                // 重置信息显示区域
+                document.getElementById('transactionDate').textContent = '-';
+                document.getElementById('unitNav').textContent = '-';
+                document.getElementById('changeRate').textContent = '-';
+                document.getElementById('changeRate').className = 'info-value';
             }});
+            
             svg.addEventListener('mousemove', function(evt) {{
                 var rect = svg.getBoundingClientRect();
-                var x = evt.clientX - rect.left - 0; // 相对svg左上角
+                var x = evt.clientX - rect.left;
+                var y = evt.clientY - rect.top;
+                
                 // 限定到绘图区域
                 var cx = Math.max(paddingLeft, Math.min(width - paddingRight, x));
+                var cy = Math.max(paddingTop, Math.min(height - paddingBottom, y));
+                
+                // 计算对应的数据索引
                 var ratio = (cx - paddingLeft) / chartWidth;
-                // 使用线性插值计算 y 值
                 var fIndex = ratio * (values.length - 1);
-                var i0 = Math.floor(fIndex);
-                var i1 = Math.min(values.length - 1, i0 + 1);
-                var t = fIndex - i0;
-                var yVal = values[i0] * (1 - t) + values[i1] * t;
-                var xPos = cx;
-                hoverLine.setAttribute('x1', xPos);
-                hoverLine.setAttribute('x2', xPos);
-                hoverLine.style.opacity = 1;
-
-                // 取日期标签用最近点索引展示
-                var idx = Math.round(fIndex);
-                var tip = '日期: ' + data[idx].date + '<br/>单位净值: <b>' + yVal.toFixed(4) + '</b>';
-                if (costPrice && costPrice !== 'N/A') {{
-                    tip += '<br/>成本单价: <span style="color:#ff6b6b;">' + parseFloat(costPrice).toFixed(4) + '</span>';
+                var idx = Math.round(fIndex); // 四舍五入到最近的数据点
+                
+                // 计算更精确的曲线位置（插值计算）
+                var exactX = cx;
+                var exactY;
+                
+                if (fIndex >= 0 && fIndex < values.length - 1) {{
+                    // 在两个数据点之间进行线性插值
+                    var idx1 = Math.floor(fIndex);
+                    var idx2 = Math.ceil(fIndex);
+                    var weight = fIndex - idx1;
+                    
+                    var nav1 = data[idx1].nav;
+                    var nav2 = data[idx2].nav;
+                    var interpolatedNav = nav1 + (nav2 - nav1) * weight;
+                    
+                    exactY = paddingTop + ((maxValue - interpolatedNav) * chartHeight / valueRange);
+                }} else {{
+                    // 边界情况，使用最近的数据点
+                    var currentNav = data[idx].nav;
+                    exactY = paddingTop + ((maxValue - currentNav) * chartHeight / valueRange);
                 }}
-                tooltip.innerHTML = tip;
-                tooltip.style.display = 'block';
-                tooltip.style.fontSize = '14px';
-                // 固定定位：基于视口坐标，垂直居中于绘图区上方，且不被遮挡
-                var svgRect = svg.getBoundingClientRect();
-                tooltip.style.left = (rect.left + xPos) + 'px';
-                tooltip.style.top = (svgRect.top + paddingTop + 50) + 'px';
+                
+                // 获取当前数据点信息
+                var currentData = data[idx];
+                var currentNav = currentData.nav;
+                var currentDate = currentData.date;
+                
+                // 计算涨跌幅（如果有前一天数据）
+                var changePercent = '';
+                var changeClass = '';
+                if (idx > 0) {{
+                    var prevNav = data[idx - 1].nav;
+                    var change = ((currentNav - prevNav) / prevNav * 100);
+                    changePercent = (change >= 0 ? '+' : '') + change.toFixed(2) + '%';
+                    changeClass = change >= 0 ? 'positive' : 'negative';
+                }}
+                
+                // 设置垂直虚线位置
+                hoverVerticalLine.setAttribute('x1', cx);
+                hoverVerticalLine.setAttribute('x2', cx);
+                hoverVerticalLine.style.opacity = 1;
+                
+                // 设置水平虚线位置（使用插值计算的精确位置）
+                hoverHorizontalLine.setAttribute('y1', exactY);
+                hoverHorizontalLine.setAttribute('y2', exactY);
+                hoverHorizontalLine.style.opacity = 1;
+                
+                // 创建空心圆标记（确保XY轴交点落在曲线上）
+                // 移除之前的圆标记
+                var existingCircle = svg.querySelector('.hover-circle');
+                if (existingCircle) {{
+                    svg.removeChild(existingCircle);
+                }}
+                
+                // 创建空心圆组
+                var circleGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+                circleGroup.setAttribute('class', 'hover-circle');
+                
+                // 空心圆（与趋势线颜色相近，边框加粗）
+                var hollowCircle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                hollowCircle.setAttribute('cx', exactX);
+                hollowCircle.setAttribute('cy', exactY);
+                hollowCircle.setAttribute('r', '8');
+                hollowCircle.setAttribute('fill', 'none');
+                hollowCircle.setAttribute('stroke', '#007bff');
+                hollowCircle.setAttribute('stroke-width', '4');
+                circleGroup.appendChild(hollowCircle);
+                
+                // 将空心圆组添加到SVG
+                svg.appendChild(circleGroup);
+                
+                // 更新信息显示区域
+                document.getElementById('transactionDate').textContent = currentDate;
+                document.getElementById('unitNav').textContent = currentNav.toFixed(4);
+                
+                if (changePercent) {{
+                    var changeElement = document.getElementById('changeRate');
+                    changeElement.textContent = changePercent;
+                    changeElement.className = 'info-value ' + changeClass;
+                }} else {{
+                    document.getElementById('changeRate').textContent = '-';
+                    document.getElementById('changeRate').className = 'info-value';
+                }}
+                
+                // 更新持仓成本信息（如果鼠标移动时有成本价）
+                if (costPrice && costPrice !== 'N/A') {{
+                    document.getElementById('holdingCost').textContent = parseFloat(costPrice).toFixed(4);
+                }}
+                
+                // 显示动态坐标轴标签
+                // X轴标签（交易日期）
+                xAxisLabel.setAttribute('x', cx);
+                xAxisLabel.setAttribute('y', height - paddingBottom + 35);
+                xAxisLabel.setAttribute('text-anchor', 'middle');
+                xAxisLabel.setAttribute('font-size', '12');
+                xAxisLabel.setAttribute('fill', '#007bff');
+                xAxisLabel.setAttribute('font-weight', 'bold');
+                xAxisLabel.textContent = currentDate;
+                xAxisLabel.style.opacity = 1;
+                if (!svg.contains(xAxisLabel)) {{
+                    svg.appendChild(xAxisLabel);
+                }}
+                
+                // Y轴标签（单位净值）
+                yAxisLabel.setAttribute('x', paddingLeft - 15);
+                yAxisLabel.setAttribute('y', exactY + 4);
+                yAxisLabel.setAttribute('text-anchor', 'end');
+                yAxisLabel.setAttribute('font-size', '12');
+                yAxisLabel.setAttribute('fill', '#007bff');
+                yAxisLabel.setAttribute('font-weight', 'bold');
+                yAxisLabel.textContent = currentNav.toFixed(4);
+                yAxisLabel.style.opacity = 1;
+                if (!svg.contains(yAxisLabel)) {{
+                    svg.appendChild(yAxisLabel);
+                }}
             }});
+            
+            // 初始化信息显示区域
+            document.getElementById('transactionDate').textContent = '-';
+            document.getElementById('unitNav').textContent = '-';
+            document.getElementById('changeRate').textContent = '-';
+            document.getElementById('changeRate').className = 'info-value';
+            
+            if (costPrice && costPrice !== 'N/A') {{
+                try {{
+                    document.getElementById('holdingCost').textContent = parseFloat(costPrice).toFixed(4);
+                }} catch (e) {{
+                    document.getElementById('holdingCost').textContent = '-';
+                }}
+            }} else {{
+                document.getElementById('holdingCost').textContent = '-';
+            }}
             
             // 将SVG添加到容器
             chartContainer.appendChild(svg);
             console.log('SVG图表创建成功');
+        }}
+        
+        function updateFundInfoCard(date, value, costPrice, data) {{
+            // 更新交易日期
+            document.getElementById('transactionDate').textContent = date;
+            
+            // 更新单位净值
+            document.getElementById('unitNav').textContent = value.toFixed(4);
+            
+            // 更新持仓成本
+            var costElement = document.getElementById('holdingCost');
+            if (costPrice && costPrice !== 'N/A' && costPrice !== '-') {{
+                costElement.textContent = parseFloat(costPrice).toFixed(4);
+            }} else {{
+                costElement.textContent = '-';
+            }}
+            
+            // 计算并更新涨跌幅
+            var changeRateElement = document.getElementById('changeRate');
+            var currentIndex = data.findIndex(function(item) {{ return item.date === date; }});
+            
+            if (currentIndex > 0) {{
+                var prevValue = parseFloat(data[currentIndex - 1].nav);
+                var changeRate = ((value - prevValue) / prevValue) * 100;
+                var changeText = (changeRate >= 0 ? '+' : '') + changeRate.toFixed(2) + '%';
+                
+                changeRateElement.textContent = changeText;
+                changeRateElement.className = 'info-value ' + (changeRate > 0 ? 'positive' : changeRate < 0 ? 'negative' : 'neutral');
+            }} else {{
+                changeRateElement.textContent = '-';
+                changeRateElement.className = 'info-value neutral';
+            }}
         }}
     </script>
 </body>
@@ -4415,6 +4752,18 @@ def update_holdings_from_holdings_file(holdings_file='holdings_data.xlsx', auto_
         
         log_info("🔄 开始更新持仓数据...")
         
+        # 先更新持仓文件中的基金名称（使用最新的基金数据）
+        if fund_data_dict:
+            try:
+                calculator = HoldingsProfitCalculator()
+                name_updated = calculator.update_fund_names_in_holdings(holdings_data, fund_data_dict, verbose=False)
+                if name_updated:
+                    # 重新加载更新后的持仓数据
+                    holdings_data = calculator.load_holdings_from_excel(holdings_file)
+                    log_info("✓ 基金名称已更新到最新版本")
+            except Exception as e:
+                log_info(f"⚠️  更新基金名称失败: {e}")
+        
         # 获取基金净值数据 - 优先使用已有的基金数据
         fund_codes = set()
         for trade in trading_data:
@@ -4465,7 +4814,7 @@ def update_holdings_from_holdings_file(holdings_file='holdings_data.xlsx', auto_
         log_info(f"📊 净值: 今日 {len(fund_nav_data)} 只, 估算 {len(fund_nav_data)} 只")
         
         # 更新持仓数据
-        success = calculator.update_holdings_from_trading_data(holdings_data, trading_data, fund_nav_data)
+        success = calculator.update_holdings_from_trading_data(holdings_data, trading_data, fund_nav_data, fund_data_dict)
         
         if success:
             log_info("✅ 持仓数据更新成功")
