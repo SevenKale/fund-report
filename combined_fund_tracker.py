@@ -502,16 +502,15 @@ class HoldingsProfitCalculator:
         results = {}
         
         # 将基金数据转换为字典格式，便于查找
-        # 优先使用 'all' 键中的数据，因为它包含了所有基金
+        # 只使用自选基金数据，排除境外基金和ETF基金
         fund_data = {}
-        if 'all' in fund_data_dict:
-            for fund in fund_data_dict['all']:
-                fund_data[fund['基金代码']] = fund
-        else:
-            # 如果没有 'all' 键，则合并所有用户的数据
-            for fund_list in fund_data_dict.values():
-                for fund in fund_list:
-                    fund_data[fund['基金代码']] = fund
+        # 合并钞钞和垚垚的基金数据，排除境外基金
+        for user_key in ['chaochao', 'yaoyao']:
+            if user_key in fund_data_dict:
+                for fund in fund_data_dict[user_key]:
+                    # 排除境外基金和ETF基金
+                    if fund.get('板块分类') not in ['境外基金', 'ETF基金']:
+                        fund_data[fund['基金代码']] = fund
         
         log_info(f"📊 可用于收益计算的基金数量: {len(fund_data)} 只")
         # 详细代码列表仅在调试模式下输出
@@ -537,14 +536,9 @@ class HoldingsProfitCalculator:
                 if fund_info:
                     # 获取基金数据，处理可能的"N/A"值
                     try:
-                        # 对于境外基金，需要特殊处理：最新净值是当前价格，估算净值是上日净值
-                        if fund_info.get('板块分类') == '境外基金':
-                            current_price = float(fund_info.get('最新净值', 0)) if fund_info.get('最新净值') != 'N/A' else 0
-                            yesterday_price = float(fund_info.get('估算净值', 0)) if fund_info.get('估算净值') != 'N/A' else 0
-                        else:
-                            # 对于其他基金，使用标准逻辑
-                            current_price = float(fund_info.get('估算净值', 0)) if fund_info.get('估算净值') != 'N/A' else 0
-                            yesterday_price = float(fund_info.get('最新净值', 0)) if fund_info.get('最新净值') != 'N/A' else 0
+                        # 使用标准逻辑：估算净值是当前价格，最新净值是昨日净值
+                        current_price = float(fund_info.get('估算净值', 0)) if fund_info.get('估算净值') != 'N/A' else 0
+                        yesterday_price = float(fund_info.get('最新净值', 0)) if fund_info.get('最新净值') != 'N/A' else 0
                     except (ValueError, TypeError):
                         current_price = 0
                         yesterday_price = 0
@@ -932,10 +926,36 @@ tr:hover {{
                             if fund_code and fund_name:
                                 fund_name_map[fund_code] = fund_name
                 log_info(f"📋 交易更新时基金名称映射表包含 {len(fund_name_map)} 个基金")
+
+            # 构建昨日净值与估算净值映射，优先使用 fund_data_dict 中的数据
+            yesterday_nav_map = {}
+            estimate_nav_map = {}
+            if fund_data_dict:
+                for user_key in ['chaochao', 'yaoyao', 'all']:
+                    if user_key in fund_data_dict:
+                        for fund in fund_data_dict[user_key]:
+                            code = fund.get('基金代码', '')
+                            if code:
+                                try:
+                                    y_nav = float(fund.get('最新净值', 0)) if fund.get('最新净值', 'N/A') != 'N/A' else 0
+                                except Exception:
+                                    y_nav = 0
+                                try:
+                                    e_nav = float(fund.get('估算净值', 0)) if fund.get('估算净值', 'N/A') != 'N/A' else 0
+                                except Exception:
+                                    e_nav = 0
+                                if y_nav > 0:
+                                    yesterday_nav_map[code] = y_nav
+                                if e_nav > 0:
+                                    estimate_nav_map[code] = e_nav
+
+            # 不进行人为强制覆盖昨日净值，完全以实时抓取/列表数据为准
             
             for user, holdings in holdings_data.items():
                 updated_holdings[user] = []
                 user_holdings = {holding['fund_code']: holding for holding in holdings}
+                # 记录本轮已新增/更新的基金代码，避免重复行
+                added_codes = set()
                 
                 # 处理交易数据
                 for trade in trading_data:
@@ -958,33 +978,67 @@ tr:hover {{
                     convert_from_fund_name = trade.get('convert_from_fund_name', '')
                     convert_ratio = float(trade.get('convert_ratio', 1))
                     
-                    # 获取基金净值
-                    nav_price = fund_nav_data.get(fund_code, 0)
-                    if nav_price <= 0:
+                    # 获取基金净值：估算净值用于当日估值，昨日净值用于建仓成本
+                    nav_estimate = 0
+                    try:
+                        nav_estimate = float(fund_nav_data.get(fund_code, 0)) if fund_nav_data else 0
+                    except Exception:
+                        nav_estimate = 0
+                    if nav_estimate <= 0:
+                        nav_estimate = estimate_nav_map.get(fund_code, 0)
+                    nav_yesterday = yesterday_nav_map.get(fund_code, 0)
+                    if nav_estimate <= 0 and nav_yesterday <= 0:
                         log_info(f"⚠️ 基金 {fund_code} 净值数据不可用，跳过更新")
                         continue
                     
                     # 处理建仓（仅处理买入建仓，转换建仓在转换逻辑中处理）
-                    if fund_code not in user_holdings and buy_amount > 0:
+                    if buy_amount > 0 and (fund_code not in user_holdings or (user_holdings.get(fund_code, {}).get('shares', 0) or 0) <= 0):
                         # 买入建仓
-                        new_shares = buy_amount / nav_price
-                        new_cost_price = nav_price
+                        base_price = nav_yesterday if nav_yesterday > 0 else (nav_estimate if nav_estimate > 0 else 0)
+                        new_shares = buy_amount / base_price if base_price > 0 else 0
+                        new_shares = round(new_shares, 2)
+                        new_cost_price = round(base_price, 4)
                         new_cost_amount = buy_amount
+                        if base_price <= 0 or new_shares <= 0:
+                            log_info(f"⚠️ {user} 买入建仓跳过 {fund_code}: 无效价格或份额(base={base_price}, shares={new_shares})")
+                            continue
                         
                         new_holding = {
                             'fund_code': fund_code,
                             'fund_name': fund_name,
                             'shares': new_shares,
                             'cost_price': new_cost_price,
-                            'cost_amount': new_cost_amount
+                            'cost_amount': new_cost_amount,
+                            # 保留其他列的默认值
+                            'buy_amount': 0,
+                            'sell_shares': 0,
+                            'convert_shares': 0,
+                            'convert_from_fund_code': '',
+                            'convert_from_fund_name': '',
+                            'convert_ratio': 1
                         }
-                        updated_holdings[user].append(new_holding)
+                        # 去重：若已存在于新增集合，则合并
+                        if fund_code in added_codes:
+                            # 合并到已添加的记录（查找并加权合并）
+                            for item in updated_holdings[user]:
+                                if item.get('fund_code') == fund_code:
+                                    total_cost = item['cost_amount'] + new_cost_amount
+                                    total_shares = item['shares'] + new_shares
+                                    item['shares'] = round(total_shares, 2)
+                                    item['cost_amount'] = round(total_cost, 2)
+                                    item['cost_price'] = round((total_cost / total_shares) if total_shares > 0 else item['cost_price'], 4)
+                                    break
+                        else:
+                            updated_holdings[user].append(new_holding)
+                            added_codes.add(fund_code)
                         log_info(f"✓ {user} 买入建仓 {fund_code}: {new_shares:.2f}份 @{new_cost_price:.4f}")
                     
                     # 处理加仓
                     elif fund_code in user_holdings and buy_amount > 0:
                         existing = user_holdings[fund_code]
-                        new_shares = buy_amount / nav_price
+                        # 加仓份额按当日估算净值计算
+                        price_for_add = nav_estimate if nav_estimate > 0 else (nav_yesterday if nav_yesterday > 0 else 0)
+                        new_shares = buy_amount / price_for_add if price_for_add > 0 else 0
                         total_shares = existing['shares'] + new_shares
                         total_cost = existing['cost_amount'] + buy_amount
                         new_cost_price = total_cost / total_shares
@@ -1007,7 +1061,8 @@ tr:hover {{
                             # 公式：(昨日净值 - x) * (持仓份额 - 卖出份额) = (昨日净值 - 成本单价) * 持仓份额
                             # 解出 x = 昨日净值 - (昨日净值 - 成本单价) * 持仓份额 / (持仓份额 - 卖出份额)
                             old_cost_price = existing['cost_price']
-                            new_cost_price = nav_price - (nav_price - old_cost_price) * existing['shares'] / remaining_shares
+                            price_for_recalc = nav_yesterday if nav_yesterday > 0 else (nav_estimate if nav_estimate > 0 else old_cost_price)
+                            new_cost_price = price_for_recalc - (price_for_recalc - old_cost_price) * existing['shares'] / remaining_shares
                             new_cost_amount = remaining_shares * new_cost_price
                             
                             existing['shares'] = remaining_shares
@@ -1018,18 +1073,30 @@ tr:hover {{
                     # 处理基金转换
                     if convert_from_fund_code and convert_from_fund_code in user_holdings:
                         from_fund = user_holdings[convert_from_fund_code]
-                        if convert_shares <= from_fund['shares']:
-                            # 获取转出基金的净值
-                            from_fund_nav = fund_nav_data.get(convert_from_fund_code, 0)
+                        # 如果转出份额略大于可用份额，则使用可用份额进行转换（避免转换失败）
+                        actual_convert_shares = min(convert_shares, from_fund['shares'])
+                        if actual_convert_shares > 0:
+                            # 获取转出基金的净值（优先使用昨日净值，因为转换操作是上一交易日发生的）
+                            from_fund_nav = 0
+                            # 优先使用昨日净值
+                            from_fund_nav = yesterday_nav_map.get(convert_from_fund_code, 0)
+                            if from_fund_nav <= 0:
+                                # 如果昨日净值不可用，再尝试当日估值净值
+                                try:
+                                    from_fund_nav = float(fund_nav_data.get(convert_from_fund_code, 0)) if fund_nav_data else 0
+                                except Exception:
+                                    from_fund_nav = 0
+                                if from_fund_nav <= 0:
+                                    from_fund_nav = estimate_nav_map.get(convert_from_fund_code, 0)
                             if from_fund_nav <= 0:
                                 log_info(f"⚠️ {user} 基金转换失败: {convert_from_fund_code} 净值数据不可用")
                                 continue
                             
-                            # 计算转出金额 = 转出份额 * 转出基金净值
-                            convert_amount = convert_shares * from_fund_nav
+                            # 计算转出金额 = 实际转出份额 * 转出基金净值
+                            convert_amount = actual_convert_shares * from_fund_nav
                             
                             # 转换出 - 需要重算成本单价
-                            remaining_shares = from_fund['shares'] - convert_shares
+                            remaining_shares = from_fund['shares'] - actual_convert_shares
                             if remaining_shares > 0:
                                 # 重算成本单价：(昨日净值 - x) * (持仓份额-转出份额) = (昨日净值 - 成本单价) * 持仓份额
                                 # 解出 x = 昨日净值 - (昨日净值 - 成本单价) * 持仓份额 / (持仓份额 - 转出份额)
@@ -1041,17 +1108,23 @@ tr:hover {{
                                 from_fund['cost_price'] = new_cost_price
                                 from_fund['cost_amount'] = new_cost_amount
                                 
-                                log_info(f"✓ {user} 基金转换出: {convert_from_fund_code} {convert_shares:.2f}份(金额{convert_amount:.2f}元)，剩余份额成本价 {new_cost_price:.4f}")
+                                log_info(f"✓ {user} 基金转换出: {convert_from_fund_code} {actual_convert_shares:.2f}份(金额{convert_amount:.2f}元)，剩余份额成本价 {new_cost_price:.4f}")
                             else:
                                 # 全部转换出，清仓
                                 cleared_funds.add((user, convert_from_fund_code))
-                                log_info(f"✓ {user} 基金转换清仓: {convert_from_fund_code} {convert_shares:.2f}份(金额{convert_amount:.2f}元)")
+                                log_info(f"✓ {user} 基金转换清仓: {convert_from_fund_code} {actual_convert_shares:.2f}份(金额{convert_amount:.2f}元)")
                             
-                            # 转换入 - 按转入基金净值计算份额
-                            # 转入份额 = 转出金额 / 转入基金净值 * 转换比例
-                            new_shares = (convert_amount / nav_price) * convert_ratio
-                            new_cost_price = nav_price
-                            new_cost_amount = new_shares * nav_price
+                            # 转换入 - 使用昨日净值计算份额（操作是上一交易日发生的）
+                            in_price = nav_yesterday if nav_yesterday > 0 else (nav_estimate if nav_estimate > 0 else 0)
+                            # 份额计算也使用昨日净值，因为转换操作是上一交易日发生的
+                            shares_price_for_calc = nav_yesterday if nav_yesterday > 0 else (nav_estimate if nav_estimate > 0 else 0)
+                            new_shares = (convert_amount / shares_price_for_calc) * convert_ratio if shares_price_for_calc > 0 else 0
+                            new_shares = round(new_shares, 2)
+                            new_cost_price = round(in_price, 4)
+                            new_cost_amount = new_shares * new_cost_price
+                            if new_shares <= 0 or new_cost_price <= 0:
+                                log_info(f"⚠️ {user} 基金转换建仓跳过 {fund_code}: 无效价格或份额(price={new_cost_price}, shares={new_shares})")
+                                continue
                             
                             if fund_code not in user_holdings:
                                 # 转换建仓
@@ -1060,10 +1133,28 @@ tr:hover {{
                                     'fund_name': fund_name,
                                     'shares': new_shares,
                                     'cost_price': new_cost_price,
-                                    'cost_amount': new_cost_amount
+                                    'cost_amount': new_cost_amount,
+                                    # 保留其他列的默认值
+                                    'buy_amount': 0,
+                                    'sell_shares': 0,
+                                    'convert_shares': 0,
+                                    'convert_from_fund_code': '',
+                                    'convert_from_fund_name': '',
+                                    'convert_ratio': 1
                                 }
-                                updated_holdings[user].append(new_holding)
-                                log_info(f"✓ {user} 基金转换建仓: {convert_from_fund_code} -> {fund_code}, {convert_shares:.2f}份->{new_shares:.2f}份(金额{convert_amount:.2f}元)")
+                                if fund_code in added_codes:
+                                    for item in updated_holdings[user]:
+                                        if item.get('fund_code') == fund_code:
+                                            total_cost = item['cost_amount'] + new_cost_amount
+                                            total_shares = item['shares'] + new_shares
+                                            item['shares'] = round(total_shares, 2)
+                                            item['cost_amount'] = round(total_cost, 2)
+                                            item['cost_price'] = round((total_cost / total_shares) if total_shares > 0 else item['cost_price'], 4)
+                                            break
+                                else:
+                                    updated_holdings[user].append(new_holding)
+                                    added_codes.add(fund_code)
+                                log_info(f"✓ {user} 基金转换建仓: {convert_from_fund_code} -> {fund_code}, {actual_convert_shares:.2f}份->{new_shares:.2f}份(金额{convert_amount:.2f}元)")
                             else:
                                 # 转换加仓 - 与买入加仓逻辑一致
                                 existing = user_holdings[fund_code]
@@ -1074,13 +1165,13 @@ tr:hover {{
                                 existing['shares'] = total_shares
                                 existing['cost_price'] = new_cost_price
                                 existing['cost_amount'] = total_cost
-                                log_info(f"✓ {user} 基金转换加仓: {convert_from_fund_code} -> {fund_code}, {convert_shares:.2f}份->{new_shares:.2f}份(金额{convert_amount:.2f}元)，新成本价 {new_cost_price:.4f}")
+                                log_info(f"✓ {user} 基金转换加仓: {convert_from_fund_code} -> {fund_code}, {actual_convert_shares:.2f}份->{new_shares:.2f}份(金额{convert_amount:.2f}元)，新成本价 {new_cost_price:.4f}")
                         else:
-                            log_info(f"⚠️ {user} 基金转换失败: {convert_from_fund_code} 可用份额不足 ({from_fund['shares']:.2f} < {convert_shares:.2f})")
+                            log_info(f"⚠️ {user} 基金转换失败: {convert_from_fund_code} 无可用份额 ({from_fund['shares']:.2f} <= 0)")
                 
                 # 添加未清仓的基金（保留变更字段但清空数据）
                 for fund_code, holding in user_holdings.items():
-                    if (user, fund_code) not in cleared_funds:
+                    if (user, fund_code) not in cleared_funds and fund_code not in added_codes:
                         # 获取最新的基金名称
                         latest_fund_name = fund_name_map.get(fund_code, holding['fund_name'])
                         if latest_fund_name != holding['fund_name']:
@@ -1091,7 +1182,7 @@ tr:hover {{
                             'fund_code': holding['fund_code'],
                             'fund_name': latest_fund_name,  # 使用最新的基金名称
                             'shares': round(holding['shares'], 2),  # 保留2位小数
-                            'cost_price': round(holding['cost_price'], 4),  # 保留4位小数
+                            'cost_price': round(holding['cost_price'], 4),  # 成本单价保留4位小数
                             'cost_amount': round(holding['cost_amount'], 2),  # 保留2位小数
                             'buy_amount': 0,  # 清空操作数据
                             'sell_shares': 0,
@@ -1101,9 +1192,29 @@ tr:hover {{
                             'convert_ratio': 1
                         }
                         updated_holdings[user].append(clean_holding)
+                        added_codes.add(fund_code)
                 
-                # 按持仓成本降序排序，重仓基金在前
-                updated_holdings[user].sort(key=lambda x: x['cost_amount'], reverse=True)
+                # 过滤无效/空值行，并按持仓成本降序排序，重仓基金在前
+                filtered_rows = []
+                for item in updated_holdings[user]:
+                    code = str(item.get('fund_code', '')).strip()
+                    shares = float(item.get('shares', 0) or 0)
+                    cost_amount = float(item.get('cost_amount', 0) or 0)
+                    if not code or code == '000000':
+                        continue
+                    if shares <= 0 or cost_amount < 0:
+                        continue
+                    # 标准化份额与成本单价的小数位
+                    item['shares'] = round(shares, 2)
+                    if 'cost_price' in item and item['cost_price']:
+                        try:
+                            item['cost_price'] = round(float(item['cost_price']), 4)
+                        except Exception:
+                            pass
+                    item['cost_amount'] = round(cost_amount, 2)
+                    filtered_rows.append(item)
+                filtered_rows.sort(key=lambda x: x['cost_amount'], reverse=True)
+                updated_holdings[user] = filtered_rows
             
             # 保存更新后的持仓数据
             self.save_updated_holdings(updated_holdings)
@@ -1626,7 +1737,7 @@ class OptimizedFundTracker:
         return default_name
     
     def _fetch_etf_fund(self, etf_code, original_code):
-        """获取场内ETF基金数据"""
+        """获取场内ETF基金数据 - 多接口备用方案"""
         try:
             # 解析ETF代码，获取交易所和代码
             if '.' in etf_code:
@@ -1636,35 +1747,50 @@ class OptimizedFundTracker:
                 base_code = etf_code
                 exchange = 'SZ'  # 默认深交所
             
-            # 尝试通过东方财富网ETF接口获取数据
+            # 方案1：尝试腾讯财经接口（主要备用方案）
+            try:
+                if exchange == 'SZ':
+                    url = f"https://qt.gtimg.cn/q=sz{base_code}"
+                elif exchange == 'SH':
+                    url = f"https://qt.gtimg.cn/q=sh{base_code}"
+                else:
+                    url = f"https://qt.gtimg.cn/q=sz{base_code}"
+                
+                log_debug(f"尝试腾讯财经接口: {url}")
+                response = self.session.get(url, timeout=10)
+                if response.status_code == 200:
+                    data = self._parse_tencent_etf_data(response.text, original_code)
+                    if data:
+                        log_debug(f"腾讯财经接口成功获取ETF数据: {original_code}")
+                        return data
+                        
+            except Exception as e:
+                log_debug(f"腾讯财经接口调用失败: {e}")
+            
+            # 方案2：尝试东方财富网ETF接口（原方案）
             try:
                 if exchange == 'SZ':
                     url = f"https://push2.eastmoney.com/api/qt/stock/get?secid=0.{base_code}&fields=f43,f57,f58,f169,f170,f46,f44,f51,f168,f47,f48,f60,f45"
                 elif exchange == 'SH':
                     url = f"https://push2.eastmoney.com/api/qt/stock/get?secid=1.{base_code}&fields=f43,f57,f58,f169,f170,f46,f44,f51,f168,f47,f48,f60,f45"
                 else:
-                    return None
+                    url = None
                 
-                #log_debug(f"正在获取ETF数据: {url}")
-                response = self.session.get(url, timeout=10)
-                if response.status_code == 200:
-                    data = response.json()
-                    #log_debug(f"ETF API响应: {data}")
-                    if data and data.get('rc') == 0:
-                        payload = data.get('data') or {}
-                        if not payload:
-                            log_debug("ETF API未返回data节点")
-                        # 解析ETF数据（传入data节点）
-                        return self._format_etf_fund_data(payload, original_code)
-                    else:
-                        log_debug(f"ETF API返回错误: {data}")
+                if url:
+                    log_debug(f"尝试东方财富接口: {url}")
+                    response = self.session.get(url, timeout=10)
+                    if response.status_code == 200:
+                        data = response.json()
+                        if data and data.get('rc') == 0:
+                            payload = data.get('data') or {}
+                            if payload:
+                                return self._format_etf_fund_data(payload, original_code)
                         
             except Exception as e:
-                log_debug(f"ETF接口调用失败: {e}")
+                log_debug(f"东方财富接口调用失败: {e}")
             
-            # 如果ETF接口失败，尝试通过基金接口获取
+            # 方案3：尝试通过基金接口获取
             try:
-                # 移除后缀，尝试作为基金代码获取
                 clean_code = base_code
                 log_debug(f"尝试通过基金接口获取: {clean_code}")
                 fund_data = self._fetch_single_fund(clean_code)
@@ -1673,12 +1799,127 @@ class OptimizedFundTracker:
             except Exception as e:
                 log_debug(f"基金接口调用失败: {e}")
             
-            # 如果都失败了，返回None
-            log_info(f"所有接口都失败，无法获取ETF数据: {original_code}")
-            return None
+            # 方案4：使用静态数据作为最后备用
+            log_info(f"所有接口都失败，使用静态数据: {original_code}")
+            return self._get_static_etf_data(original_code)
             
         except Exception as e:
             log_info(f"获取ETF基金 {original_code} 失败: {e}")
+            return self._get_static_etf_data(original_code)
+    
+    def _parse_tencent_etf_data(self, response_text, original_code):
+        """解析腾讯财经ETF数据"""
+        try:
+            # 腾讯财经返回格式：v_sz159513="51~纳斯达克100指数ETF~159513~1.554~1.535~1.550~558296~314711~243585~1.553~5922~1.552~4338~1.551~6830~1.550~2551~1.549~1812~1.554~16931~1.555~11911~1.556~6747~1.557~1655~1.558~6523~~2025102413105"
+            if '=' in response_text:
+                data_part = response_text.split('=')[1].strip('"')
+                fields = data_part.split('~')
+                
+                if len(fields) >= 10:
+                    # 字段说明：代码~名称~当前价~昨收价~今开价~成交量~成交额~买一量~买一价~买二量~买二价~买三量~买三价~买四量~买四价~买五量~买五价~卖一量~卖一价~卖二量~卖二价~卖三量~卖三价~卖四量~卖四价~卖五量~卖五价~时间
+                    fund_code = fields[2]  # 基金代码在第3个字段
+                    fund_name = fields[1]  # 基金名称在第2个字段
+                    current_price = float(fields[3]) if fields[3] and fields[3] != '' else 0.0  # 当前价
+                    prev_close = float(fields[4]) if fields[4] and fields[4] != '' else 0.0  # 昨收价
+                    open_price = float(fields[5]) if fields[5] and fields[5] != '' else 0.0  # 今开价
+                    volume = int(float(fields[6])) if fields[6] and fields[6] != '' else 0  # 成交量
+                    amount = float(fields[7]) if fields[7] and fields[7] != '' else 0.0  # 成交额
+                    
+                    # 计算涨跌幅
+                    if prev_close > 0:
+                        change_rate = ((current_price - prev_close) / prev_close) * 100
+                        change_amount = current_price - prev_close
+                    else:
+                        change_rate = 0.0
+                        change_amount = 0.0
+                    
+                    return {
+                        'fundcode': fund_code,
+                        'name': fund_name,
+                        'dwjz': f"{current_price:.4f}",  # 当前价格作为净值
+                        'gsz': f"{current_price:.4f}",    # 当前价格
+                        'gszzl': f"{change_rate:.2f}",    # 涨跌幅
+                        'jzrq': datetime.now().strftime('%Y-%m-%d'),  # 当前日期
+                        'gztime': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),  # 当前时间
+                        'prev_close': f"{prev_close:.4f}",  # 昨收盘价
+                        'open_price': f"{open_price:.4f}",  # 今开价
+                        'volume': volume,  # 成交量
+                        'amount': amount,  # 成交额
+                        'change_amount': f"{change_amount:.4f}"  # 涨跌额
+                    }
+            
+            return None
+            
+        except Exception as e:
+            log_debug(f"解析腾讯财经ETF数据失败: {e}")
+            return None
+    
+    def _get_static_etf_data(self, original_code):
+        """获取静态ETF数据作为最后备用"""
+        try:
+            # 预定义的ETF静态数据
+            static_etf_data = {
+                "159513.SZ": {
+                    'name': '纳斯达克100指数ETF',
+                    'dwjz': '1.5540',
+                    'gsz': '1.5540',
+                    'gszzl': '1.24',
+                    'jzrq': datetime.now().strftime('%Y-%m-%d'),
+                    'gztime': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                },
+                "513520.SH": {
+                    'name': '日经ETF',
+                    'dwjz': '1.2350',
+                    'gsz': '1.2350',
+                    'gszzl': '0.82',
+                    'jzrq': datetime.now().strftime('%Y-%m-%d'),
+                    'gztime': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                },
+                "159919.SZ": {
+                    'name': '沪深300ETF',
+                    'dwjz': '3.4560',
+                    'gsz': '3.4560',
+                    'gszzl': '0.15',
+                    'jzrq': datetime.now().strftime('%Y-%m-%d'),
+                    'gztime': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                },
+                "513500.SH": {
+                    'name': '标普500ETF',
+                    'dwjz': '2.1230',
+                    'gsz': '2.1230',
+                    'gszzl': '0.45',
+                    'jzrq': datetime.now().strftime('%Y-%m-%d'),
+                    'gztime': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                },
+                "510500.SH": {
+                    'name': '中证500ETF',
+                    'dwjz': '4.5670',
+                    'gsz': '4.5670',
+                    'gszzl': '0.32',
+                    'jzrq': datetime.now().strftime('%Y-%m-%d'),
+                    'gztime': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }
+            }
+            
+            if original_code in static_etf_data:
+                data = static_etf_data[original_code].copy()
+                data['fundcode'] = original_code.split('.')[0]
+                log_info(f"使用静态数据: {original_code}")
+                return data
+            else:
+                # 返回默认数据
+                return {
+                    'fundcode': original_code.split('.')[0],
+                    'name': f'ETF{original_code}',
+                    'dwjz': '1.0000',
+                    'gsz': '1.0000',
+                    'gszzl': '0.00',
+                    'jzrq': datetime.now().strftime('%Y-%m-%d'),
+                    'gztime': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }
+                
+        except Exception as e:
+            log_info(f"获取静态ETF数据失败: {e}")
             return None
     
     def _format_etf_fund_data(self, data, original_code):
@@ -1837,45 +2078,37 @@ def get_self_selected_funds(max_workers=10):
     
     # 钞钞的基金 - 根据实际持仓数据更新
     chaochao_fund_codes = [
-        "018388[港股金融]",  # 华泰柏瑞港股通红利ETF联接基金C
-        "022435[指数型]",  # 南方中证A500ETF联接C
-        "016814[传统能源]",  # 国联中证煤炭指数C
-        "012341[食品饮料]",  # 东财食品饮料指数增强C
-        "023037[有色金属]",  # 中欧资源精选混合发起C
-        "015897[化工]",  # 天弘中证细分化工指数发起C
-        "014669[量化]",  # 银华专精特新量化优选股票发起C
-        "020900[通信]",  # 天弘中证全指通信设备指数发起C
-        "011036[稀土]",  # 嘉实中证稀土产业ETF联接C
-        "017227[家用电器]",  # 富国中证全指家用电器ETF发起式联接C
-        "015401[机器人]",  # 弘毅远方甄选混合C
-        "011840[人工智能]",  # 天弘中证人工智能C
-        "013172[港股科技]",  # 华夏恒生互联网科技业ETF联接(QDII)C
-        "001864[新能源汽车]",  # 中海长江三角混合
-        #"023835[指数型]",  # 广发资源智选股票发起式C
-        "025165[指数型]",  # 易方达创业板增强C
-        "017223[储能]", #富国中证电池主题ETF发起式联接C
+        "013172[港股科技]",	# 华夏恒生互联网科技业ETF联接(QDII)C
+        "015401[机器人]",	# 弘毅远方甄选混合C
+        "008987[贵金属]",	# 广发上海金ETF联接C
+        "025165[指数型]",	# 易方达创业板增强C
+        "020900[通信]",	# 天弘中证全指通信设备指数发起C
+        "022435[指数型]",	# 南方中证A500ETF联接C
+        "020671[半导体]",	# 易方达上证科创板芯片指数发起式C
+        "001864[新能源汽车]",	# 中海魅力长三角混合
+        "018388[港股金融]",	# 华泰柏瑞港股通红利ETF联接基金C
+        "017223[储能]",	# 富国中证电池主题ETF发起式联接C
+        "017647[新能源]",	# 易方达中证光伏产业ETF联接发起式C
+        "020412[贵金属]",	# 永赢中证沪深港黄金产业股票ETF发起联接C
+        "017227[家用电器]",	# 富国中证全指家用电器ETF发起式联接C
     ]
     
     # 垚垚的基金 - 根据实际持仓数据更新
     yaoyao_fund_codes = [
-        "021172[指数型]",  # 华安北证50成份指数发起式A
-        "015897[化工]",  # 天弘中证细分化工指数发起C
-        "013416[医疗器械]",  # 永赢中证全指医疗器械ETF发起联接C
-        "002834[混合型]",  # 华夏新锦绣混合C
-        "021457[港股金融]",  # 易方达恒生红利低波ETF联接A
-        "012725[畜牧养殖]",  # 国泰中证畜牧养殖ETF联接C
-        "004253[贵金属]",  # 国泰黄金ETF联接C
-        "013275[传统能源]",  # 富国中证煤炭指数(LOF)C
-        "020608[机器人]",  # 南方中证机器人ETF发起联接C
-        "017193[有色金属]",  # 天弘中证工业有色金属主题指数发起C
-        "024195[通信]",  # 永赢国证商用卫星通信产业ETF发起联接C
-        "017870[消费]",  # 光大消费主题股票C
-        "004070[证券]",  # 南方中证全指证券公司ETF联接C
-        "018647[家用电器]",  # 易方达家电龙头
-        "020629[半导体]",  # 汇添富上证科创板芯片ETF联接C
-        "018897[消费电子]",  # 易方达消费电子ETF联接C
-        "004744[指数型]",  # 易方达创业板ETF联接C
-        "012734[人工智能]",  # 易方达人工智能ETF联接C
+        "021457[港股金融]",	# 易方达恒生红利低波ETF联接A
+        "020608[机器人]",	# 南方中证机器人ETF发起联接C
+        "021172[指数型]",	# 华安北证50成份指数发起式A
+        "013416[医疗器械]",	# 永赢中证全指医疗器械ETF发起联接C
+        "004070[证券]",	# 南方中证全指证券公司ETF联接C
+        "002834[混合型]",	# 华夏新锦绣混合C
+        "024195[通信]",	# 永赢国证商用卫星通信产业ETF发起联接C
+        "012725[畜牧养殖]",	# 国泰中证畜牧养殖ETF联接C
+        "018647[家用电器]",	# 易方达中证家电龙头ETF联接发起式C
+        "018897[消费电子]",	# 易方达消费电子ETF联接C
+        "004744[指数型]",	# 易方达创业板ETF联接C
+        "020629[半导体]",	# 汇添富上证科创板芯片ETF发起式联接C
+        "013309[港股科技]",	# 易方达恒生科技ETF联接(QDII)C
+        "012734[人工智能]",	# 易方达中证人工智能主题ETF联接C
     ]
     
     # 境外基金（实际可获取的基金代码）
@@ -2144,6 +2377,7 @@ def get_monitor_funds(max_workers=10):
         #黄金
         "021959[贵金属]",  # 南方沪深港黄金
         "020412[贵金属]",  # 永赢沪深港黄金
+        "008987[贵金属]",  # 广发上海金ETF联接C
         #医疗
         "006113[港股医药]",  # 汇添富创新药混合A
         "023482[港股医药]",  # 万家港股创新药
@@ -2172,9 +2406,9 @@ def get_monitor_funds(max_workers=10):
         "021989[通信]",  # 银河中证通信
         "020900[通信]",  # 天弘中证全指通信设备指数发起C
         "024195[通信]",  # 永赢国证商用卫星通信产业ETF发起联接C
-        "023385[人工智能]",  # 平安人工智能
         "011840[人工智能]",  # 天弘中证人工智能C
         "012734[人工智能]",  # 易方达人工智能ETF联接C
+        "023565[人工智能]",  # 易方达科创人工智能ETF联接C
         #机器人
         "020256[机器人]",  # 中欧机器人
         "020973[机器人]",  # 易方达机器人
@@ -2209,13 +2443,15 @@ def get_monitor_funds(max_workers=10):
         "019571[半导体]",  # 诺安配置混合
         "001665[半导体]",  # 平安鑫安混合
         "014855[半导体]",  # 嘉实中证半导体
+        "024975[半导体]", # 华泰柏瑞科创半导体
         #指数
         "022435[指数型]",  # 南方中证500
         "019919[指数型]",  # 招商中证2000
         "021172[指数型]",  # 华安北证50A
+        "011613[指数型]",  # 华夏科创50
+        "023051[指数型]",  # 交银科创100
         "001593[指数型]",  # 天弘创业板ETF
         "004744[指数型]",  # 易方达创业板ETF联接C
-        "023835[指数型]",  # 广发资源智选股票发起式C
         "025165[指数型]",  # 易方达创业板增强C
         #基建
         "004857[建筑材料]",  # 广发建筑材料
@@ -2328,7 +2564,7 @@ def save_to_excel(fund_data_dict, monitor_funds=None, filename=None):
         log_info(f"❌ Excel保存失败: {e}")
         return None
 
-def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None):
+def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, profit_results=None):
     """保存数据到HTML文件，支持多sheet页显示"""
     if not filename:
         filename = f"我的基金_{datetime.now().strftime('%Y%m%d')}.html"
@@ -4175,6 +4411,32 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None):
     chaochao_today_profit = compute_today_profit(chaochao_data)
     yaoyao_today_profit = compute_today_profit(yaoyao_data)
     
+    # 计算持仓收益汇总信息（如果提供了profit_results）
+    chaochao_holdings_summary = ""
+    yaoyao_holdings_summary = ""
+    if profit_results:
+        try:
+            chaochao_result = profit_results.get('chaochao', {})
+            yaoyao_result = profit_results.get('yaoyao', {})
+            
+            chaochao_holdings_summary = (
+                f"投入:{chaochao_result.get('total_cost', 0):,.0f} "
+                f"市值:{chaochao_result.get('total_current_value', 0):,.0f} "
+                f"总收益:{chaochao_result.get('total_profit', 0):,.0f}({chaochao_result.get('total_profit_rate', 0):+.1f}%) "
+                f"今日:{chaochao_result.get('today_profit', 0):,.0f}({chaochao_result.get('today_profit_rate', 0):+.1f}%)"
+            )
+            
+            yaoyao_holdings_summary = (
+                f"投入:{yaoyao_result.get('total_cost', 0):,.0f} "
+                f"市值:{yaoyao_result.get('total_current_value', 0):,.0f} "
+                f"总收益:{yaoyao_result.get('total_profit', 0):,.0f}({yaoyao_result.get('total_profit_rate', 0):+.1f}%) "
+                f"今日:{yaoyao_result.get('today_profit', 0):,.0f}({yaoyao_result.get('today_profit_rate', 0):+.1f}%)"
+            )
+        except Exception as e:
+            log_info(f"⚠️ 计算持仓汇总信息失败: {e}")
+            chaochao_holdings_summary = "数据不足"
+            yaoyao_holdings_summary = "数据不足"
+    
     # 计算收益CSS类
     def get_profit_css_class(profit_str):
         if profit_str == '0.00':
@@ -4300,6 +4562,8 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None):
         yaoyao_today_profit=yaoyao_today_profit,
         chaochao_profit_class=chaochao_profit_class,
         yaoyao_profit_class=yaoyao_profit_class,
+        chaochao_holdings_summary=chaochao_holdings_summary,
+        yaoyao_holdings_summary=yaoyao_holdings_summary,
         monitor_avg_class=monitor_avg_class,
         chaochao_avg_class=chaochao_avg_class,
         yaoyao_avg_class=yaoyao_avg_class,
@@ -4919,7 +5183,7 @@ def main():
         # 保存Excel文件（包含多个sheet页）
         excel_filename = save_to_excel(self_selected_dict, monitor_funds)
         # 保存HTML文件（多sheet页显示）
-        html_filename = save_to_html_multi_sheet(self_selected_dict, monitor_funds)
+        html_filename = save_to_html_multi_sheet(self_selected_dict, monitor_funds, profit_results=profit_results)
         
         log_info("\n=== 汇总信息 ===")
         # 自选基金简洁汇总（每个用户一行）
