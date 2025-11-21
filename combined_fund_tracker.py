@@ -1371,6 +1371,37 @@ class OptimizedFundTracker:
                                 data['gszzl'] = '0.00'  # 今日净值涨跌率为0
                                 data['gztime'] = f"{today} 15:00"  # 更新时间
                             
+                            # 检查估算净值是否为空或无效，如果是则尝试备用方案
+                            gsz = data.get('gsz', '')
+                            if not gsz or gsz == '' or gsz == 'NaN' or gsz == 'null':
+                                log_info(f"⚠️ {fund_code} 估算净值为空，尝试备用方案...")
+                                
+                                # 首先尝试使用最新净值作为估算净值
+                                dwjz = data.get('dwjz', '')
+                                if dwjz and dwjz != '' and dwjz != 'NaN' and dwjz != 'null':
+                                    data['gsz'] = dwjz
+                                    data['gszzl'] = '0.00'  # 使用最新净值时涨跌率为0
+                                    data['gztime'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                                    log_info(f"✅ {fund_code} 使用最新净值作为估算净值: {dwjz}")
+                                else:
+                                    # 如果最新净值也没有，尝试其他备用方案
+                                    backup_data = self._fetch_fund_backup(fund_code)
+                                    if backup_data:
+                                        # 使用备用数据补充缺失的字段
+                                        if not gsz and backup_data.get('gsz'):
+                                            data['gsz'] = backup_data['gsz']
+                                        if not data.get('gszzl') or data.get('gszzl') == 'NaN':
+                                            data['gszzl'] = backup_data.get('gszzl', '0.00')
+                                        if not data.get('gztime') or data.get('gztime') == '0001-01-01 00:00':
+                                            data['gztime'] = backup_data.get('gztime', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                                        log_info(f"✅ {fund_code} 备用方案获取成功")
+                                    else:
+                                        log_info(f"⚠️ {fund_code} 所有备用方案均失败，使用最新净值")
+                                        if dwjz:
+                                            data['gsz'] = dwjz
+                                            data['gszzl'] = '0.00'
+                                            data['gztime'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            
                             return data
                     else:
                         last_error = f"HTTP {response.status_code}"
@@ -1384,6 +1415,120 @@ class OptimizedFundTracker:
             else:
                 log_info(f"❌ {fund_code}: 未知错误")
         return None
+    
+    def _fetch_fund_backup(self, fund_code):
+        """备用方案获取基金数据"""
+        try:
+            # 方案1: 尝试使用天天基金网的历史净值接口
+            history_url = f"https://fund.eastmoney.com/f10/F10DataApi.aspx?type=lsjz&code={fund_code}&page=1&per=1"
+            response = self.session.get(history_url, timeout=5)
+            if response.status_code == 200:
+                # 解析历史净值数据
+                content = response.text
+                if 'var apidata=' in content:
+                    # 提取JSON数据
+                    start = content.find('var apidata=') + 12
+                    end = content.find(';', start)
+                    if end > start:
+                        json_str = content[start:end]
+                        try:
+                            import json
+                            data = json.loads(json_str)
+                            if data and 'content' in data and data['content']:
+                                # 获取最新净值
+                                latest_nav = data['content'][0].get('单位净值', '0')
+                                if latest_nav and latest_nav != '0':
+                                    return {
+                                        'gsz': latest_nav,
+                                        'gszzl': '0.00',  # 历史净值无法计算实时涨跌
+                                        'gztime': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                                    }
+                        except:
+                            pass
+            
+            # 方案2: 尝试使用新浪财经接口
+            sina_url = f"https://hq.sinajs.cn/list=f_{fund_code}"
+            response = self.session.get(sina_url, timeout=5)
+            if response.status_code == 200:
+                content = response.text
+                if 'var hq_str_' in content:
+                    # 解析新浪数据格式
+                    parts = content.split('"')[1].split(',')
+                    if len(parts) >= 3:
+                        nav = parts[2]  # 净值
+                        if nav and nav != '0':
+                            return {
+                                'gsz': nav,
+                                'gszzl': '0.00',
+                                'gztime': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            }
+            
+            # 方案3: 尝试使用腾讯财经接口
+            tencent_url = f"https://qt.gtimg.cn/q=sz{fund_code}"
+            response = self.session.get(tencent_url, timeout=5)
+            if response.status_code == 200:
+                content = response.text
+                if 'v_' in content:
+                    # 解析腾讯数据格式
+                    parts = content.split('"')[1].split('~')
+                    if len(parts) >= 3:
+                        nav = parts[3]  # 净值
+                        if nav and nav != '0':
+                            return {
+                                'gsz': nav,
+                                'gszzl': '0.00',
+                                'gztime': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            }
+            
+            # 方案4: 尝试使用东方财富网基金详情页
+            eastmoney_url = f"https://fund.eastmoney.com/{fund_code}.html"
+            response = self.session.get(eastmoney_url, timeout=5)
+            if response.status_code == 200:
+                content = response.text
+                # 查找净值信息
+                import re
+                nav_pattern = r'<span class="ui-num">(\d+\.\d+)</span>'
+                nav_match = re.search(nav_pattern, content)
+                if nav_match:
+                    nav = nav_match.group(1)
+                    return {
+                        'gsz': nav,
+                        'gszzl': '0.00',
+                        'gztime': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    }
+            
+            # 方案5: 尝试使用基金历史净值API
+            nav_api_url = f"https://fund.eastmoney.com/f10/F10DataApi.aspx?type=lsjz&code={fund_code}&page=1&per=5"
+            response = self.session.get(nav_api_url, timeout=5)
+            if response.status_code == 200:
+                content = response.text
+                if 'var apidata=' in content:
+                    start = content.find('var apidata=') + 12
+                    end = content.find(';', start)
+                    if end > start:
+                        json_str = content[start:end]
+                        try:
+                            import json
+                            data = json.loads(json_str)
+                            if data and 'content' in data and data['content']:
+                                # 获取最新净值
+                                latest_record = data['content'][0]
+                                nav = latest_record.get('单位净值', '0')
+                                if nav and nav != '0':
+                                    return {
+                                        'gsz': nav,
+                                        'gszzl': '0.00',
+                                        'gztime': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                                    }
+                        except:
+                            pass
+            
+            log_info(f"⚠️ {fund_code} 所有备用方案均失败")
+            return None
+            
+        except Exception as e:
+            log_info(f"⚠️ {fund_code} 备用方案获取失败: {e}")
+            return None
     
     def get_funds_realtime(self, fund_codes):
         """获取基金实时数据 - 并发版本"""
@@ -1673,7 +1818,10 @@ class OptimizedFundTracker:
             "012920": "易方达全球成长精选混合(QDII)人民币A",
             "000834": "大成纳斯达克100ETF联接(QDII)A",
             "270042": "广发纳斯达克100ETF联接人民币(QDII)A",
-            "019671": "广发港股创新药ETF联接(QDII)C"
+            "019671": "广发港股创新药ETF联接(QDII)C",
+            "022122": "国泰海通中证香港科技指数发起(QDII)C",
+            "006105": "宏利印度股票(QDII)",
+            "020712": "华安三菱日联日经225ETF发起式联接(QDII)A"
         }
         
         if fund_code in predefined_names:
@@ -2082,15 +2230,25 @@ def get_self_selected_funds(max_workers=10):
         "015401[机器人]",	# 弘毅远方甄选混合C
         "008987[贵金属]",	# 广发上海金ETF联接C
         "025165[指数型]",	# 易方达创业板增强C
-        "020900[通信]",	# 天弘中证全指通信设备指数发起C
         "022435[指数型]",	# 南方中证A500ETF联接C
-        "020671[半导体]",	# 易方达上证科创板芯片指数发起式C
-        "001864[新能源汽车]",	# 中海魅力长三角混合
+        "001864[机器人]",	# 中海魅力长三角混合
         "018388[港股金融]",	# 华泰柏瑞港股通红利ETF联接基金C
-        "017223[储能]",	# 富国中证电池主题ETF发起式联接C
-        "017647[新能源]",	# 易方达中证光伏产业ETF联接发起式C
-        "020412[贵金属]",	# 永赢中证沪深港黄金产业股票ETF发起联接C
         "017227[家用电器]",	# 富国中证全指家用电器ETF发起式联接C
+        "016582[贵金属]",   # 嘉实上海金ETF联接C
+        "024663[人工智能]", # 富国创业板人工智能
+        "023887[指数型]",   # 永赢北证50
+        "023896[指数型]",   # 天弘科创综合
+        "023482[港股医药]",  # 万家港股创新药
+        "025209[半导体]",  # 永赢先锋半导体智选混合发起C
+        "013180[储能]",  # 广发国证新能源车电池ETF联接C
+        "016008[消费电子]",  # 招商中证消费电子主题ETF联接C
+        "017647[新能源]",  # 易方达光伏
+        "015897[化工]",  # 天弘中证化工
+        "022486[指数型]",  # 国金中证A500
+        "020671[半导体]",  # 易方达科创板芯片
+        "290014[储能]",  # 泰信现代服务业混合
+        "023829[半导体]",  # 万家中证半导体材料设备主题
+        "025194[证券]",  #银华中证全指证券公司ETF发起式联接C
     ]
     
     # 垚垚的基金 - 根据实际持仓数据更新
@@ -2099,16 +2257,19 @@ def get_self_selected_funds(max_workers=10):
         "020608[机器人]",	# 南方中证机器人ETF发起联接C
         "021172[指数型]",	# 华安北证50成份指数发起式A
         "013416[医疗器械]",	# 永赢中证全指医疗器械ETF发起联接C
-        "004070[证券]",	# 南方中证全指证券公司ETF联接C
+        "004070[证券]",     # 南方中证全指证券公司ETF联接C
         "002834[混合型]",	# 华夏新锦绣混合C
-        "024195[通信]",	# 永赢国证商用卫星通信产业ETF发起联接C
+        "024195[通信]",	    # 永赢国证商用卫星通信产业ETF发起联接C
         "012725[畜牧养殖]",	# 国泰中证畜牧养殖ETF联接C
         "018647[家用电器]",	# 易方达中证家电龙头ETF联接发起式C
         "018897[消费电子]",	# 易方达消费电子ETF联接C
-        "004744[指数型]",	# 易方达创业板ETF联接C
-        "020629[半导体]",	# 汇添富上证科创板芯片ETF发起式联接C
         "013309[港股科技]",	# 易方达恒生科技ETF联接(QDII)C
-        "012734[人工智能]",	# 易方达中证人工智能主题ETF联接C
+        "025209[半导体]",   # 永赢先锋半导体智选混合发起C
+        "020900[通信]",  # 天弘中证全指通信设备指数发起C
+        "015945[军工]",  # 易方达军工混合
+        "012769[传媒]",  # 华夏中证动漫游戏ETF发起式联接C
+        "021959[贵金属]",  # 南方沪深港黄金
+        "015897[化工]",  # 天弘中证化工
     ]
     
     # 境外基金（实际可获取的基金代码）
@@ -2120,6 +2281,9 @@ def get_self_selected_funds(max_workers=10):
         "000834",  # 大成纳斯达克
         "270042",  # 广发纳指100
         "019671",  # 广发港股创新药ETF联接(QDII)C
+        "022122",  # 国泰海通中证香港科技指数发起(QDII)C
+        "006105",  # 宏利印度股票(QDII)
+        "020712",  # 华安三菱日联日经225ETF发起式联接(QDII)A
     ]
     
     # ETF基金代码（场内交易）
@@ -2378,6 +2542,7 @@ def get_monitor_funds(max_workers=10):
         "021959[贵金属]",  # 南方沪深港黄金
         "020412[贵金属]",  # 永赢沪深港黄金
         "008987[贵金属]",  # 广发上海金ETF联接C
+        "016582[贵金属]",  # 嘉实上海金ETF联接C
         #医疗
         "006113[港股医药]",  # 汇添富创新药混合A
         "023482[港股医药]",  # 万家港股创新药
@@ -2385,6 +2550,7 @@ def get_monitor_funds(max_workers=10):
         "024380[港股医药]",  # 平安港股通医疗混合
         "013416[医疗器械]",  # 永赢医疗器械
         "014565[港股医药]",  # 天弘沪深港创新药
+        "020398[港股医药]",  # 中银沪港通创新药
         #银行
         "016573[金融]",  # 招商银行AH
         "021457[港股金融]",  # 易方达红利低波A
@@ -2392,6 +2558,8 @@ def get_monitor_funds(max_workers=10):
         "019026[金融]",  # 易方达金融股票
         "006810[港股金融]",  # 泰康香港银行
         "004070[证券]",  # 南方中证全指证券公司ETF联接C
+        "025194[证券]",  #银华中证全指证券公司ETF发起式联接C
+        "012420[金融]",  # 广发价值领先混合C
         #通信
         "022365[通信]",  # 永赢智选混合
         "004409[通信]",  # 招商TMT
@@ -2399,9 +2567,8 @@ def get_monitor_funds(max_workers=10):
         "021717[云计算]",  # 招商云计算ETF
         "019170[云计算]",  # 天弘沪港深云计算
         "014819[科技]",  # 国金新兴价值混合
-        "020671[半导体]",  # 易方达科创板芯片
-        "020629[半导体]",  # 汇添富上证科创板芯片ETF联接C
         "014422[科技]",  # 弘毅消费混合
+        "377240[科技]",  # 摩根新兴动力混合
         "018994[通信]",  # 中欧数字经济混合
         "021989[通信]",  # 银河中证通信
         "020900[通信]",  # 天弘中证全指通信设备指数发起C
@@ -2409,21 +2576,24 @@ def get_monitor_funds(max_workers=10):
         "011840[人工智能]",  # 天弘中证人工智能C
         "012734[人工智能]",  # 易方达人工智能ETF联接C
         "023565[人工智能]",  # 易方达科创人工智能ETF联接C
+        "024663[人工智能]",  # 富国创业板人工智能
         #机器人
         "020256[机器人]",  # 中欧机器人
         "020973[机器人]",  # 易方达机器人
         "015401[机器人]",  # 弘毅甄选混合
         "018125[机器人]",  # 永赢制造混合
         "020608[机器人]",  # 南方中证机器人ETF发起联接C
+        "001864[机器人]",  # 中海长江三角混合
         #量化
         "014806[量化]",  # 国金量化混合
         "020902[量化]",  # 招商量化选股
-        "014669[量化]",  # 银华专精特新量化优选股票发起C
         #新能源
         "017647[新能源]",  # 易方达光伏
+        "018419[新能源]",  # 广发碳中和混合
         "015528[新能源汽车]",  # 弘毅汽车混合
-        "001864[新能源汽车]",  # 中海长江三角混合
-        "017223[储能]", #富国中证电池主题ETF发起式联接C
+        "017223[储能]",  # 富国中证电池主题ETF发起式联接C
+        "013180[储能]",  # 广发国证新能源车电池ETF联接C
+        "290014[储能]",  # 泰信现代服务业混合
         #传统能源
         "016814[传统能源]",  # 国联中证煤炭
         "013275[传统能源]",  # 富国中证煤炭指数(LOF)C
@@ -2434,23 +2604,30 @@ def get_monitor_funds(max_workers=10):
         "017193[有色金属]",  # 天弘中证工业有色金属主题指数发起C
         "023037[有色金属]",  # 中欧资源精选混合发起C
         "012725[畜牧养殖]",  # 国泰畜牧养殖
+        #消费
         "012341[消费]",  # 东财食品饮料指数
         "017870[消费]",  # 光大消费主题股票C
         "018650[消费]",  # 兴银消费混合
         "018897[消费电子]",  # 易方达消费电子ETF联接C
+        "016008[消费电子]",  # 招商中证消费电子主题ETF联接C
+        "012769[传媒]",  # 华夏中证动漫游戏ETF发起式联接C
         #半导体
-        "012651[半导体]",  # 博时半导体
         "019571[半导体]",  # 诺安配置混合
         "001665[半导体]",  # 平安鑫安混合
         "014855[半导体]",  # 嘉实中证半导体
-        "024975[半导体]", # 华泰柏瑞科创半导体
+        "025209[半导体]",  # 永赢先锋半导体智选混合发起C
+        "023829[半导体]",  # 万家中证半导体材料设备主题
+        "020671[半导体]",  # 易方达科创板芯片
+        "020629[半导体]",  # 汇添富上证科创板芯片ETF联接C
         #指数
         "022435[指数型]",  # 南方中证500
+        "022486[指数型]",  # 国金中证A500
         "019919[指数型]",  # 招商中证2000
-        "021172[指数型]",  # 华安北证50A
+        "021172[指数型]",  # 华安北证50
+        "023887[指数型]",  # 永赢北证50
         "011613[指数型]",  # 华夏科创50
         "023051[指数型]",  # 交银科创100
-        "001593[指数型]",  # 天弘创业板ETF
+        "023896[指数型]",  # 天弘科创综合
         "004744[指数型]",  # 易方达创业板ETF联接C
         "025165[指数型]",  # 易方达创业板增强C
         #基建
@@ -5433,6 +5610,3 @@ if __name__ == "__main__":
             main()
     else:
         main()
-
-
-
