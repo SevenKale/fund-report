@@ -314,6 +314,9 @@ class FundCategoryClassifier:
         }
         return descriptions.get(category, "未知类型")
 
+# 定义用户列表常量
+SUPPORTED_USERS = ['chaochao', 'yaoyao', 'QDII']
+
 class HoldingsProfitCalculator:
     """持仓收益计算器"""
     def __init__(self):
@@ -914,6 +917,7 @@ tr:hover {{
             
             updated_holdings = {}
             cleared_funds = set()  # 记录需要清仓的基金
+            trades_by_user = {}    # 收集本次交易记录
             
             # 创建基金代码到基金名称的映射，用于更新基金名称
             fund_name_map = {}
@@ -956,6 +960,7 @@ tr:hover {{
                 user_holdings = {holding['fund_code']: holding for holding in holdings}
                 # 记录本轮已新增/更新的基金代码，避免重复行
                 added_codes = set()
+                trades_by_user[user] = []
                 
                 # 处理交易数据
                 for trade in trading_data:
@@ -1002,6 +1007,10 @@ tr:hover {{
                         if base_price <= 0 or new_shares <= 0:
                             log_info(f"⚠️ {user} 买入建仓跳过 {fund_code}: 无效价格或份额(base={base_price}, shares={new_shares})")
                             continue
+                        # 记录交易
+                        trades_by_user[user].append(
+                            self._build_trade_record(fund_code, fund_name, 'buy', new_shares, base_price, new_cost_amount)
+                        )
                         
                         new_holding = {
                             'fund_code': fund_code,
@@ -1046,14 +1055,24 @@ tr:hover {{
                         existing['shares'] = total_shares
                         existing['cost_price'] = new_cost_price
                         existing['cost_amount'] = total_cost
+                        # 记录交易
+                        trades_by_user[user].append(
+                            self._build_trade_record(fund_code, fund_name, 'buy', new_shares, price_for_add, buy_amount)
+                        )
                         log_info(f"✓ {user} 加仓 {fund_code}: +{new_shares:.2f}份，新成本价 {new_cost_price:.4f}")
                     
                     # 处理减仓
                     elif fund_code in user_holdings and sell_shares > 0:
                         existing = user_holdings[fund_code]
+                        # 以当日估值/昨日净值作为成交价
+                        sell_price = nav_estimate if nav_estimate > 0 else (nav_yesterday if nav_yesterday > 0 else existing.get('cost_price', 0))
+                        sell_amount = sell_shares * sell_price
                         if sell_shares >= existing['shares']:
                             # 清仓
                             cleared_funds.add((user, fund_code))
+                            trades_by_user[user].append(
+                                self._build_trade_record(fund_code, fund_name, 'sell', sell_shares, sell_price, sell_amount)
+                            )
                             log_info(f"✓ {user} 清仓 {fund_code}: 卖出 {sell_shares:.2f}份")
                         else:
                             # 减仓，重新计算成本价
@@ -1068,6 +1087,9 @@ tr:hover {{
                             existing['shares'] = remaining_shares
                             existing['cost_price'] = new_cost_price
                             existing['cost_amount'] = new_cost_amount
+                            trades_by_user[user].append(
+                                self._build_trade_record(fund_code, fund_name, 'sell', sell_shares, sell_price, sell_amount)
+                            )
                             log_info(f"✓ {user} 减仓 {fund_code}: -{sell_shares:.2f}份，新成本价 {new_cost_price:.4f}")
                     
                     # 处理基金转换
@@ -1094,6 +1116,9 @@ tr:hover {{
                             
                             # 计算转出金额 = 实际转出份额 * 转出基金净值
                             convert_amount = actual_convert_shares * from_fund_nav
+                            trades_by_user[user].append(
+                                self._build_trade_record(convert_from_fund_code, fund_name_map.get(convert_from_fund_code, convert_from_fund_code), 'convert_out', actual_convert_shares, from_fund_nav, convert_amount)
+                            )
                             
                             # 转换出 - 需要重算成本单价
                             remaining_shares = from_fund['shares'] - actual_convert_shares
@@ -1125,6 +1150,9 @@ tr:hover {{
                             if new_shares <= 0 or new_cost_price <= 0:
                                 log_info(f"⚠️ {user} 基金转换建仓跳过 {fund_code}: 无效价格或份额(price={new_cost_price}, shares={new_shares})")
                                 continue
+                            trades_by_user[user].append(
+                                self._build_trade_record(fund_code, fund_name, 'convert_in', new_shares, new_cost_price, new_cost_amount)
+                            )
                             
                             if fund_code not in user_holdings:
                                 # 转换建仓
@@ -1217,8 +1245,12 @@ tr:hover {{
                 updated_holdings[user] = filtered_rows
             
             # 保存更新后的持仓数据
-            self.save_updated_holdings(updated_holdings)
+            holdings_excel_file = 'holdings_data.xlsx'  # 持仓数据文件名
+            trade_excel_file = 'trade_data.xlsx'  # 交易记录文件名
+            self.save_updated_holdings(updated_holdings, holdings_excel_file)
             log_info("✓ 持仓数据更新完成，操作字段已清除")
+            # 保存交易记录（同时保存到JSON和Excel）
+            self._save_trades_json(trades_by_user, directory='trades', excel_file=trade_excel_file)
             return True
             
         except Exception as e:
@@ -1237,6 +1269,591 @@ tr:hover {{
             return True
         except Exception as e:
             log_info(f"保存更新后的持仓数据失败: {e}")
+            return False
+    
+    # ===== 持仓交易记录辅助方法 =====
+    def _prev_trading_day(self, current_date=None):
+        """获取上一交易日（简单按工作日回退）"""
+        from datetime import timedelta
+        if current_date is None:
+            current_date = datetime.now().date()
+        prev_day = current_date - timedelta(days=1)
+        while prev_day.weekday() >= 5:  # 5,6 为周末
+            prev_day = prev_day - timedelta(days=1)
+        return prev_day
+    
+    def _build_trade_record(self, fund_code, fund_name=None, action=None, shares=None, price=None, amount=None, trade_date=None):
+        """构造标准交易记录（精简版：仅保留核心字段）"""
+        if trade_date is None:
+            trade_date = self._prev_trading_day().strftime('%Y-%m-%d')
+        else:
+            # 确保date格式为yyyy-MM-dd（去除时间部分）
+            if isinstance(trade_date, str):
+                trade_date = trade_date.split()[0]  # 只取日期部分
+            elif hasattr(trade_date, 'strftime'):
+                trade_date = trade_date.strftime('%Y-%m-%d')
+            else:
+                trade_date = str(trade_date).split()[0]
+        # tx_id格式：date-fund_code-action
+        # 注意：同一天同一基金可以有多种操作（如买入和卖出），每种操作会有不同的tx_id
+        tx_id = f"{trade_date}-{fund_code}-{action}"
+        return {
+            'fund_code': fund_code,
+            'date': trade_date,
+            'action': action,
+            'shares': round(float(shares), 2) if shares is not None else 0.0,
+            'tx_id': tx_id
+        }
+    
+    def _load_trades_json(self, user, directory='trades'):
+        """加载指定用户的交易JSON（若不存在返回空列表）"""
+        try:
+            filepath = os.path.join(directory, f"{user}.json")
+            if not os.path.exists(filepath):
+                return []
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return data.get('trades', []) if isinstance(data, dict) else []
+        except Exception as e:
+            log_info(f"⚠️ 无法读取交易文件: {e}")
+            return []
+    
+    def create_trade_data_template(self, excel_file='trade_data.xlsx'):
+        """创建交易记录Excel模板文件（按用户分sheet），如果文件已存在则只添加缺失的sheet"""
+        try:
+            headers = ['fund_code', 'date', 'action', 'shares', 'tx_id']  # 移除user列，因为sheet名已表示用户
+            df = pd.DataFrame(columns=headers)
+            
+            # 如果文件已存在，先备份，然后只添加缺失的sheet
+            if os.path.exists(excel_file):
+                log_info(f"📄 文件 {excel_file} 已存在，将只添加缺失的sheet，保留现有数据...")
+                # 先备份
+                self.backup_trades_data(directory='trades', excel_file=excel_file)
+                
+                # 使用openpyxl加载现有文件
+                from openpyxl import load_workbook
+                wb = load_workbook(excel_file)
+                existing_sheets = set(wb.sheetnames)
+                
+                # 检查哪些sheet缺失
+                missing_sheets = [user for user in SUPPORTED_USERS if user not in existing_sheets]
+                
+                if missing_sheets:
+                    log_info(f"📋 发现缺失的sheet: {', '.join(missing_sheets)}")
+                    # 添加缺失的sheet
+                    for user in missing_sheets:
+                        ws = wb.create_sheet(user)
+                        ws.append(headers)
+                    wb.save(excel_file)
+                    log_info(f"✓ 已添加缺失的sheet: {', '.join(missing_sheets)}")
+                else:
+                    log_info(f"✓ 所有必需的sheet已存在，无需添加")
+                
+                # 显示当前所有sheet
+                log_info(f"📋 当前Excel文件包含的sheet: {', '.join(wb.sheetnames)}")
+                return True
+            else:
+                # 文件不存在，创建新文件
+                log_info(f"📄 文件 {excel_file} 不存在，正在创建新模板...")
+                with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:
+                    for user in SUPPORTED_USERS:
+                        df.to_excel(writer, sheet_name=user, index=False)
+                log_info(f"✓ 已创建交易记录模板文件: {excel_file} (包含{', '.join(SUPPORTED_USERS)}三个sheet)")
+                return True
+        except Exception as e:
+            log_info(f"❌ 创建交易记录模板失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def backup_trades_data(self, directory='trades', excel_file='trade_data.xlsx'):
+        """备份交易记录数据（JSON和Excel），每个文件只保留一份备份"""
+        try:
+            import shutil
+            backup_success = True
+            
+            # 备份JSON文件
+            for user in SUPPORTED_USERS:
+                json_file = os.path.join(directory, f"{user}.json")
+                if os.path.exists(json_file):
+                    backup_json = os.path.join(directory, f"{user}_backup.json")
+                    try:
+                        shutil.copy2(json_file, backup_json)
+                        log_info(f"✓ JSON备份: {json_file} -> {backup_json}")
+                    except Exception as e:
+                        log_info(f"⚠️ JSON备份失败 {json_file}: {e}")
+                        backup_success = False
+            
+            # 备份Excel文件
+            if os.path.exists(excel_file):
+                backup_excel = excel_file.replace('.xlsx', '_backup.xlsx')
+                try:
+                    shutil.copy2(excel_file, backup_excel)
+                    log_info(f"✓ Excel备份: {excel_file} -> {backup_excel}")
+                except Exception as e:
+                    log_info(f"⚠️ Excel备份失败 {excel_file}: {e}")
+                    backup_success = False
+            
+            return backup_success
+        except Exception as e:
+            log_info(f"❌ 备份交易记录失败: {e}")
+            return False
+    
+    def restore_trades_from_backup(self, excel_file='trade_data.xlsx', directory='trades'):
+        """从备份恢复交易记录数据（JSON和Excel）"""
+        try:
+            import shutil
+            restore_success = True
+            
+            # 恢复JSON文件
+            for user in SUPPORTED_USERS:
+                backup_json = os.path.join(directory, f"{user}_backup.json")
+                json_file = os.path.join(directory, f"{user}.json")
+                if os.path.exists(backup_json):
+                    try:
+                        shutil.copy2(backup_json, json_file)
+                        log_info(f"✓ JSON恢复: {backup_json} -> {json_file}")
+                    except Exception as e:
+                        log_info(f"⚠️ JSON恢复失败 {backup_json}: {e}")
+                        restore_success = False
+                else:
+                    log_info(f"⚠️ 未找到备份文件: {backup_json}")
+            
+            # 恢复Excel文件
+            backup_excel = excel_file.replace('.xlsx', '_backup.xlsx')
+            if os.path.exists(backup_excel):
+                try:
+                    shutil.copy2(backup_excel, excel_file)
+                    log_info(f"✓ Excel恢复: {backup_excel} -> {excel_file}")
+                except Exception as e:
+                    log_info(f"⚠️ Excel恢复失败 {backup_excel}: {e}")
+                    restore_success = False
+            else:
+                log_info(f"⚠️ 未找到备份文件: {backup_excel}")
+            
+            if restore_success:
+                log_info("✅ 所有备份文件已恢复")
+            else:
+                log_info("⚠️ 部分备份文件恢复失败，请检查日志")
+            
+            return restore_success
+        except Exception as e:
+            log_info(f"❌ 恢复交易记录失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def _save_trades_json(self, trades_by_user, directory='trades', excel_file='trade_data.xlsx'):
+        """将交易记录写入JSON和Excel，按用户拆文件，增量合并"""
+        try:
+            # 先备份现有数据
+            self.backup_trades_data(directory, excel_file)
+            
+            os.makedirs(directory, exist_ok=True)
+            all_trades_for_excel = []  # 收集所有交易记录用于Excel备份
+            
+            for user, records in trades_by_user.items():
+                existing = self._load_trades_json(user, directory)
+                # 按 tx_id 去重合并
+                merged = {item.get('tx_id'): item for item in existing if item.get('tx_id')}
+                for rec in records:
+                    merged[rec.get('tx_id')] = rec
+                final_list = list(merged.values())
+                # 统一处理date格式为yyyy-MM-dd（去除时间部分）
+                for trade in final_list:
+                    if 'date' in trade and trade['date']:
+                        date_val = trade['date']
+                        if isinstance(date_val, str):
+                            trade['date'] = date_val.split()[0]  # 只取日期部分
+                        elif hasattr(date_val, 'strftime'):
+                            trade['date'] = date_val.strftime('%Y-%m-%d')
+                        else:
+                            trade['date'] = str(date_val).split()[0]
+                # 按日期排序
+                final_list.sort(key=lambda x: (x.get('date', ''), x.get('fund_code', ''), x.get('action', '')))
+                payload = {
+                    'user': user,
+                    'updated_at': datetime.now().isoformat(),
+                    'trades': final_list
+                }
+                filepath = os.path.join(directory, f"{user}.json")
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    json.dump(payload, f, ensure_ascii=False, indent=2)
+                log_info(f"✓ 交易记录已保存JSON: {filepath} ({len(final_list)} 条)")
+                
+                # 收集所有合并后的交易记录（用于Excel备份，包含历史记录）
+                # final_list中的date已经统一处理为yyyy-MM-dd格式
+                for rec in final_list:
+                    all_trades_for_excel.append({
+                        'user': user,
+                        'fund_code': rec.get('fund_code', ''),
+                        'date': rec.get('date', ''),
+                        'action': rec.get('action', ''),
+                        'shares': rec.get('shares', 0),
+                        'tx_id': rec.get('tx_id', '')
+                    })
+            
+            # 保存到Excel（按用户分sheet，增量追加）
+            if all_trades_for_excel and excel_file:
+                # 如果文件不存在，先创建模板
+                if not os.path.exists(excel_file):
+                    self.create_trade_data_template(excel_file)
+                
+                if os.path.exists(excel_file):
+                    try:
+                        from openpyxl import load_workbook
+                        wb = load_workbook(excel_file)
+                        
+                        # 兼容已有Excel：如果存在"交易记录"sheet，迁移数据到用户sheet
+                        if '交易记录' in wb.sheetnames:
+                            log_info("📋 检测到旧格式Excel，正在迁移数据到用户sheet...")
+                            try:
+                                df_old = pd.read_excel(excel_file, sheet_name='交易记录')
+                                old_trades = df_old.to_dict('records')
+                                # 按用户分组迁移
+                                for trade in old_trades:
+                                    user = trade.get('user', '').strip()
+                                    if user in SUPPORTED_USERS:
+                                        # 添加到对应用户的记录中
+                                        all_trades_for_excel.append({
+                                            'user': user,
+                                            'fund_code': str(trade.get('fund_code', '')).strip().zfill(6),
+                                            'date': str(trade.get('date', '')).strip().split()[0],
+                                            'action': str(trade.get('action', '')).strip(),
+                                            'shares': float(trade.get('shares', 0)) if pd.notna(trade.get('shares')) else 0.0,
+                                            'tx_id': str(trade.get('tx_id', '')).strip()
+                                        })
+                                log_info(f"✓ 已迁移 {len(old_trades)} 条旧记录")
+                            except Exception as e:
+                                log_info(f"⚠️ 迁移旧数据失败: {e}")
+                            # 删除旧的交易记录sheet
+                            wb.remove(wb['交易记录'])
+                        
+                        # 按用户分组处理
+                        trades_by_user_excel = {}
+                        for rec in all_trades_for_excel:
+                            user = rec.get('user', '')
+                            if user not in trades_by_user_excel:
+                                trades_by_user_excel[user] = []
+                            # 移除user字段（sheet名已表示用户）
+                            trade_rec = {
+                                'fund_code': rec.get('fund_code', ''),
+                                'date': rec.get('date', ''),
+                                'action': rec.get('action', ''),
+                                'shares': rec.get('shares', 0),
+                                'tx_id': rec.get('tx_id', '')
+                            }
+                            trades_by_user_excel[user].append(trade_rec)
+                        
+                        # 为每个用户处理sheet
+                        headers = ['fund_code', 'date', 'action', 'shares', 'tx_id']
+                        total_count = 0
+                        for user in SUPPORTED_USERS:
+                            # 读取现有记录
+                            existing_trades = []
+                            try:
+                                if user in wb.sheetnames:
+                                    df_existing = pd.read_excel(excel_file, sheet_name=user)
+                                    existing_trades = df_existing.to_dict('records')
+                                    # 统一date格式
+                                    for trade in existing_trades:
+                                        if 'date' in trade and trade['date']:
+                                            if pd.notna(trade['date']):
+                                                if isinstance(trade['date'], pd.Timestamp):
+                                                    trade['date'] = trade['date'].strftime('%Y-%m-%d')
+                                                elif isinstance(trade['date'], str):
+                                                    trade['date'] = trade['date'].split()[0]
+                                                else:
+                                                    trade['date'] = str(trade['date']).split()[0]
+                            except:
+                                pass  # sheet不存在或为空
+                            
+                            # 合并：按tx_id去重
+                            merged_trades = {}
+                            for item in existing_trades:
+                                tx_id = item.get('tx_id', '')
+                                if tx_id:
+                                    merged_trades[tx_id] = item
+                                else:
+                                    # 如果没有tx_id，使用date-fund_code-action作为key
+                                    date = item.get('date', '')
+                                    fund_code = item.get('fund_code', '')
+                                    action = item.get('action', '')
+                                    if date and fund_code and action:
+                                        key = f"{date}-{fund_code}-{action}"
+                                        merged_trades[key] = item
+                            
+                            # 添加新记录
+                            for rec in trades_by_user_excel.get(user, []):
+                                tx_id = rec.get('tx_id', '')
+                                if tx_id:
+                                    merged_trades[tx_id] = rec
+                                else:
+                                    date = rec.get('date', '')
+                                    fund_code = rec.get('fund_code', '')
+                                    action = rec.get('action', '')
+                                    if date and fund_code and action:
+                                        key = f"{date}-{fund_code}-{action}"
+                                        rec['tx_id'] = key
+                                        merged_trades[key] = rec
+                            
+                            # 排序
+                            final_list = list(merged_trades.values())
+                            final_list.sort(key=lambda x: (x.get('date', ''), x.get('fund_code', '')))
+                            
+                            # 更新或创建sheet
+                            if user in wb.sheetnames:
+                                wb.remove(wb[user])
+                            ws = wb.create_sheet(user)
+                            ws.append(headers)
+                            for trade in final_list:
+                                ws.append([trade.get(h, '') for h in headers])
+                            
+                            total_count += len(final_list)
+                            log_info(f"✓ {user}: {len(final_list)} 条记录")
+                        
+                        wb.save(excel_file)
+                        log_info(f"✓ 交易记录已备份到Excel: {excel_file} (按用户分sheet, 共 {total_count} 条)")
+                    except Exception as e:
+                        log_info(f"⚠️ 保存交易记录到Excel失败: {e}")
+                        import traceback
+                        traceback.print_exc()
+            
+            return True
+        except Exception as e:
+            log_info(f"❌ 保存交易记录失败: {e}")
+            return False
+    
+    def import_trades_from_excel(self, excel_file='trade_data.xlsx', directory='trades'):
+        """从Excel导入交易记录到JSON文件（全量覆盖），支持按用户分sheet或旧的统一sheet"""
+        try:
+            # 先备份现有JSON数据
+            self.backup_trades_data(directory, excel_file)
+            
+            if not os.path.exists(excel_file):
+                log_info(f"⚠️ Excel文件不存在: {excel_file}")
+                return False
+            
+            # 按用户分组处理
+            os.makedirs(directory, exist_ok=True)
+            trades_by_user = {}
+            
+            # 尝试从用户sheet读取（新格式）
+            has_user_sheets = False
+            for user in SUPPORTED_USERS:
+                try:
+                    df = pd.read_excel(excel_file, sheet_name=user)
+                    if not df.empty:
+                        has_user_sheets = True
+                        if user not in trades_by_user:
+                            trades_by_user[user] = []
+                        
+                        for _, row in df.iterrows():
+                            # 处理date字段：如果是Timestamp，转换为字符串，只保留yyyy-MM-dd格式
+                            date_value = row.get('date', '')
+                            if pd.notna(date_value):
+                                if isinstance(date_value, pd.Timestamp):
+                                    date_str = date_value.strftime('%Y-%m-%d')
+                                else:
+                                    date_str = str(date_value).strip().split()[0]  # 只取日期部分，去除时间
+                            else:
+                                date_str = ''
+                            
+                            fund_code = str(row.get('fund_code', '')).strip().zfill(6)
+                            action = str(row.get('action', '')).strip()
+                            
+                            # 验证必要字段
+                            if not fund_code or fund_code == '000000':
+                                continue
+                            if not date_str or date_str == 'nan':
+                                continue
+                            if not action or action == 'nan':
+                                continue
+                            
+                            # 如果没有tx_id或tx_id为空，根据date-fund_code-action生成（精简格式）
+                            tx_id = str(row.get('tx_id', '')).strip()
+                            if not tx_id or tx_id == 'nan' or tx_id == '':
+                                tx_id = f"{date_str}-{fund_code}-{action}"
+                            
+                            trade_record = {
+                                'fund_code': fund_code,
+                                'date': date_str,
+                                'action': action,
+                                'shares': float(row.get('shares', 0)) if pd.notna(row.get('shares')) else 0.0,
+                                'tx_id': tx_id
+                            }
+                            
+                            trades_by_user[user].append(trade_record)
+                except:
+                    pass  # sheet不存在，继续尝试其他sheet
+            
+            # 兼容旧格式：如果用户sheet不存在，尝试从"交易记录"sheet读取
+            if not has_user_sheets:
+                try:
+                    df = pd.read_excel(excel_file, sheet_name='交易记录')
+                    if not df.empty:
+                        log_info("📋 检测到旧格式Excel（统一sheet），正在读取...")
+                        for _, row in df.iterrows():
+                            user = str(row.get('user', '')).strip()
+                            if not user or user == 'nan' or user not in SUPPORTED_USERS:
+                                continue
+                            
+                            if user not in trades_by_user:
+                                trades_by_user[user] = []
+                            
+                            # 处理date字段
+                            date_value = row.get('date', '')
+                            if pd.notna(date_value):
+                                if isinstance(date_value, pd.Timestamp):
+                                    date_str = date_value.strftime('%Y-%m-%d')
+                                else:
+                                    date_str = str(date_value).strip().split()[0]
+                            else:
+                                date_str = ''
+                            
+                            fund_code = str(row.get('fund_code', '')).strip().zfill(6)
+                            action = str(row.get('action', '')).strip()
+                            
+                            # 验证必要字段
+                            if not fund_code or fund_code == '000000':
+                                continue
+                            if not date_str or date_str == 'nan':
+                                continue
+                            if not action or action == 'nan':
+                                continue
+                            
+                            # 如果没有tx_id或tx_id为空，根据date-fund_code-action生成
+                            tx_id = str(row.get('tx_id', '')).strip()
+                            if not tx_id or tx_id == 'nan' or tx_id == '':
+                                tx_id = f"{date_str}-{fund_code}-{action}"
+                            
+                            trade_record = {
+                                'fund_code': fund_code,
+                                'date': date_str,
+                                'action': action,
+                                'shares': float(row.get('shares', 0)) if pd.notna(row.get('shares')) else 0.0,
+                                'tx_id': tx_id
+                            }
+                            
+                            trades_by_user[user].append(trade_record)
+                except:
+                    pass  # 旧格式sheet也不存在
+            
+            # 全量覆盖到JSON文件（不合并，直接覆盖）
+            total_count = 0
+            for user, trades in trades_by_user.items():
+                # 统一处理date格式为yyyy-MM-dd（去除时间部分）
+                for trade in trades:
+                    if 'date' in trade and trade['date']:
+                        date_val = trade['date']
+                        if isinstance(date_val, str):
+                            trade['date'] = date_val.split()[0]  # 只取日期部分
+                        elif hasattr(date_val, 'strftime'):
+                            trade['date'] = date_val.strftime('%Y-%m-%d')
+                        else:
+                            trade['date'] = str(date_val).split()[0]
+                
+                # 按日期排序
+                trades.sort(key=lambda x: (x.get('date', ''), x.get('fund_code', ''), x.get('action', '')))
+                
+                payload = {
+                    'user': user,
+                    'updated_at': datetime.now().isoformat(),
+                    'trades': trades
+                }
+                filepath = os.path.join(directory, f"{user}.json")
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    json.dump(payload, f, ensure_ascii=False, indent=2)
+                
+                total_count += len(trades)
+                log_info(f"✓ {user}: 全量导入 {len(trades)} 条交易记录（覆盖原有数据）")
+            
+            log_info(f"✅ 从Excel全量导入交易记录完成，共导入 {total_count} 条记录")
+            return True
+            
+        except Exception as e:
+            log_info(f"❌ 从Excel导入交易记录失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def export_trades_to_excel(self, excel_file='trade_data.xlsx', directory='trades'):
+        """从JSON文件全量导出交易记录到Excel（全量覆盖）"""
+        try:
+            # 先备份现有Excel数据
+            if os.path.exists(excel_file):
+                import shutil
+                backup_excel = excel_file.replace('.xlsx', '_backup.xlsx')
+                try:
+                    shutil.copy2(excel_file, backup_excel)
+                    log_info(f"✓ Excel备份: {excel_file} -> {backup_excel}")
+                except Exception as e:
+                    log_info(f"⚠️ Excel备份失败 {excel_file}: {e}")
+            
+            # 按用户收集交易记录
+            trades_by_user = {}
+            for user in SUPPORTED_USERS:
+                json_file = os.path.join(directory, f"{user}.json")
+                if os.path.exists(json_file):
+                    try:
+                        with open(json_file, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                        trades = data.get('trades', []) if isinstance(data, dict) else []
+                        
+                        # 统一处理date格式为yyyy-MM-dd（去除时间部分）
+                        for trade in trades:
+                            if 'date' in trade and trade['date']:
+                                date_val = trade['date']
+                                if isinstance(date_val, str):
+                                    trade['date'] = date_val.split()[0]  # 只取日期部分
+                                elif hasattr(date_val, 'strftime'):
+                                    trade['date'] = date_val.strftime('%Y-%m-%d')
+                                else:
+                                    trade['date'] = str(date_val).split()[0]
+                        
+                        # 按日期排序
+                        trades.sort(key=lambda x: (x.get('date', ''), x.get('fund_code', '')))
+                        trades_by_user[user] = trades
+                        log_info(f"✓ 读取 {user}.json: {len(trades)} 条记录")
+                    except Exception as e:
+                        log_info(f"⚠️ 读取 {json_file} 失败: {e}")
+                        trades_by_user[user] = []
+            
+            if not any(trades_by_user.values()):
+                log_info("⚠️ 没有找到任何交易记录")
+                return False
+            
+            # 按用户分sheet写入Excel
+            headers = ['fund_code', 'date', 'action', 'shares', 'tx_id']  # 移除user列
+            with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:
+                for user in SUPPORTED_USERS:
+                    trades = trades_by_user.get(user, [])
+                    if trades:
+                        # 转换为DataFrame（移除user字段，因为sheet名已表示用户）
+                        trade_list = []
+                        for trade in trades:
+                            trade_list.append({
+                                'fund_code': trade.get('fund_code', ''),
+                                'date': trade.get('date', ''),
+                                'action': trade.get('action', ''),
+                                'shares': trade.get('shares', 0),
+                                'tx_id': trade.get('tx_id', '')
+                            })
+                        df = pd.DataFrame(trade_list, columns=headers)
+                        df.to_excel(writer, sheet_name=user, index=False)
+                    else:
+                        # 即使没有数据也创建空sheet
+                        df = pd.DataFrame(columns=headers)
+                        df.to_excel(writer, sheet_name=user, index=False)
+            
+            total_count = sum(len(trades) for trades in trades_by_user.values())
+            log_info(f"✅ 从JSON全量导出交易记录完成，共导出 {total_count} 条记录到 {excel_file} (按用户分sheet)")
+            return True
+            
+        except Exception as e:
+            log_info(f"❌ 从JSON导出交易记录失败: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     def update_fund_names_in_holdings(self, holdings_data, fund_data_dict, filename='holdings_data.xlsx', verbose=True):
@@ -1823,7 +2440,14 @@ class OptimizedFundTracker:
             "006105": "宏利印度股票(QDII)",
             "020712": "华安三菱日联日经225ETF发起式联接(QDII)A",
             "019172": "摩根纳斯达克100指数(QDII)人民币A",
-            "006373": "国富全球科技互联混合(QDII)人民币A"
+            "006373": "国富全球科技互联混合(QDII)人民币A",
+            "024773": "摩根标普港股通低波红利ETF发起式联接C",
+            "007911": "大成有色金属期货ETF联接C",
+            "025733": "华安国证航天航空行业ETF发起式联接C",
+            "017652": "中航华证商飞高端制造产业指数发起C",
+            "009225": "天弘中证中美互联网(QDII)A",
+            "014982": "华安标普全球石油指数(LOF)C",
+            "021190": "南方亚太精选ETF联接(QDII)C"
         }
         
         if fund_code in predefined_names:
@@ -2229,40 +2853,38 @@ def get_self_selected_funds(max_workers=10):
     # 钞钞的基金 - 根据实际持仓数据更新
     chaochao_fund_codes = [
         "013172[港股科技]",	# 华夏恒生互联网科技业ETF联接(QDII)C
-        "015401[机器人]",	# 弘毅远方甄选混合C
-        "008987[贵金属]",	# 广发上海金ETF联接C
-        "025165[指数型]",	# 易方达创业板增强C
-        "001864[机器人]",	# 中海魅力长三角混合
-        "023482[港股医药]",  # 万家港股创新药
         "013180[储能]",  # 广发国证新能源车电池ETF联接C
-        "017647[新能源]",  # 易方达光伏
+        "012414[消费]",  # 招商中证白酒指数
+        "021536[科技]",  # 天弘中证软件服务指数发起C
+        "023852[新能源]",  # 富国上证科创板新能源ETF发起式联接C
+        "015401[机器人]",  # 弘毅甄选混合
         "015897[化工]",  # 天弘中证化工
-        "022486[指数型]",  # 国金中证A500
-        "020671[半导体]",  # 易方达科创板芯片
-        "023829[半导体]",  # 万家中证半导体材料设备主题
-        "025194[证券]",  #银华中证全指证券公司ETF发起式联接C
-        "020902[量化]",  # 招商量化选股
-        "025446[贵金属]",  # 万家周期视野股票C
-        "002833[混合型]",  # 华夏锦绣混合
-        "022365[通信]",  # 永赢智选混合
-        "013309[港股科技]",  # 易方达恒生科技
+        "009883[半导体]",  # 华润元大核心动力混合C
+        "025209[半导体]",  # 永赢先锋半导体智选混合发起C
+        "015790[军工]",  # 永赢高端装备智选混合发起C
+        "025857[储能]",  # 华夏中证电网设备
+        "023881[科技]",  # 兴全商业模式混合(LOF)C
+        "024663[人工智能]",  # 富国创业板人工智能
     ]
     
     # 垚垚的基金 - 根据实际持仓数据更新
     yaoyao_fund_codes = [
-        "021457[港股金融]",	# 易方达恒生红利低波ETF联接A
-        "020608[机器人]",	# 南方中证机器人ETF发起联接C
-        "021172[指数型]",	# 华安北证50成份指数发起式A
         "013416[医疗器械]",	# 永赢中证全指医疗器械ETF发起联接C
         "004070[证券]",     # 南方中证全指证券公司ETF联接C
         "012725[畜牧养殖]",	# 国泰中证畜牧养殖ETF联接C
-        "018897[消费电子]",	# 易方达消费电子ETF联接C
         "013309[港股科技]",	# 易方达恒生科技ETF联接(QDII)C
-        "025209[半导体]",   # 永赢先锋半导体智选混合发起C
-        "015945[军工]",  # 易方达军工混合
-        "012769[传媒]",  # 华夏中证动漫游戏ETF发起式联接C
-        "015897[化工]",  # 天弘中证化工
-        "011103[新能源]",  # 光天弘中证光伏
+        "001595[金融]",  # 天弘中证银行ETF联接C
+        "022365[通信]",  # 永赢智选混合
+        "023754[人工智能]", # 永赢信息产业智选混合
+        "016387[科技]",  # 永赢低碳环保智选混合发起C
+        "016550[传媒]",  # 永赢消费龙头智选混合发起C
+        "024738[储能]",  # 永赢新材料智选混合发起C
+        "024203[科技]",  # 永赢制造升级混合
+        "018647[家用电器]",  # 易方达家电龙头
+        "002834[混合型]",  # 华夏新锦绣混合C
+        "025209[半导体]",  # 永赢先锋半导体智选混合发起C
+        "021172[指数型]",  # 华安北证50
+        "004744[指数型]",  # 易方达创业板ETF联接C
     ]
     
     # 境外基金（实际可获取的基金代码）
@@ -2279,6 +2901,13 @@ def get_self_selected_funds(max_workers=10):
         "020712",  # 华安三菱日联日经225ETF发起式联接(QDII)A
         "019172",  # 摩根纳斯达克100指数(QDII)人民币A
         "006373",  # 国富全球科技互联混合(QDII)人民币A
+        "024773",  # 摩根标普港股通低波红利ETF发起式联接C
+        "007911",  # 大成有色金属期货ETF
+        "025733",  # 华安国证航天航空行业ETF发起式联接C
+        "017652",  # 中航华证商飞高端制造产业指数发起C
+        "009225",  # 天弘中证中美互联网(QDII)A
+        "014982",  # 华安标普全球石油指数(LOF)C
+        "021190",  # 南方亚太精选ETF联接(QDII)C
     ]
     
     # ETF基金代码（场内交易）
@@ -2294,6 +2923,7 @@ def get_self_selected_funds(max_workers=10):
         "513330.SH",  # 恒生互联网ETF
         "512660.SH",  # 军工ETF
         "512710.SH",  # 军工龙头ETF
+        "560710.SH",  # 船舶ETF
         "588000.SH",  # 科创5OETF
         "588200.SH",  # 科创芯片ETF
         "159915.SZ",  # 创业板ETF 
@@ -2318,6 +2948,8 @@ def get_self_selected_funds(max_workers=10):
         "159755.SZ",  # 电池ETF
         "159875.SZ",  # 新能源ETF
         "159512.SZ",  # 汽车ETF
+        "159267.SZ",  # 航天ETF
+        "159206.SZ",  # 卫星ETF
     ]
     
     # 合并自选基金代码（不包括境外基金，境外基金单独处理）
@@ -2372,7 +3004,41 @@ def get_self_selected_funds(max_workers=10):
             category = tracker.classifier.classify_fund(fund_name, original_fund_code)
             category_desc = tracker.classifier.get_category_description(category)
             
-            change_rate = fund_info.get('gszzl', 'N/A')
+            # 检查估算净值日期是否与当前交易日一致
+            # 如果日期不一致（如港股闭市），使用最新净值作为估算净值，涨跌幅设为0
+            gztime = fund_info.get("gztime", "")
+            today = datetime.now().strftime('%Y-%m-%d')
+            dwjz = fund_info.get("dwjz", "N/A")
+            gsz = fund_info.get("gsz", "N/A")
+            gszzl = fund_info.get("gszzl", "N/A")
+            
+            # 提取估算净值日期（从 gztime 中提取日期部分）
+            estimate_date = None
+            if gztime and gztime != "N/A":
+                try:
+                    # gztime 格式可能是 "YYYY-MM-DD HH:mm" 或 "YYYY-MM-DD"
+                    if ' ' in gztime:
+                        estimate_date = gztime.split(' ')[0]
+                    else:
+                        estimate_date = gztime
+                except:
+                    pass
+            
+            # 如果估算净值日期不是今天，且最新净值有效，则使用最新净值
+            if estimate_date and estimate_date != today:
+                if dwjz != "N/A" and dwjz != "" and dwjz != "NaN" and dwjz != "null":
+                    try:
+                        # 验证最新净值是有效数字
+                        float(dwjz)
+                        gsz = dwjz  # 使用最新净值作为估算净值
+                        gszzl = "0.00"  # 涨跌幅设为0
+                        # 保持 gztime 为当前日期（用于列头显示），但实际净值是上日的
+                        gztime = f"{today} 15:00"
+                        log_debug(f"📅 {fund_name} ({fund_code}) 估算净值日期({estimate_date})非今日，使用最新净值({dwjz})，涨跌幅设为0")
+                    except (ValueError, TypeError):
+                        pass  # 如果最新净值无效，保持原值
+            
+            change_rate = gszzl
             change_symbol = "+" if change_rate != 'N/A' and float(change_rate) > 0 else ""
             log_debug(f"✅ {fund_name} ({fund_code}) {change_symbol}{change_rate}% [{category}]")
             
@@ -2380,11 +3046,11 @@ def get_self_selected_funds(max_workers=10):
                 "基金代码": fund_code,
                 "基金名称": fund_name,
                 "板块分类": category,
-                "最新净值": fund_info.get("dwjz", "N/A"),
-                "估算净值": fund_info.get("gsz", "N/A"),
-                "估算涨跌率": fund_info.get("gszzl", "N/A"),
+                "最新净值": dwjz,
+                "估算净值": gsz,
+                "估算涨跌率": gszzl,
                 "净值日期": fund_info.get("jzrq", "N/A"),
-                "估值时间": fund_info.get("gztime", "N/A")
+                "估值时间": gztime
             }
             
             # 根据基金代码判断属于哪个组，为每个用户创建独立的基金数据项
@@ -2535,6 +3201,7 @@ def get_monitor_funds(max_workers=10):
         "015790[军工]",  # 永赢高端装备智选混合发起C
         "015945[军工]",  # 易方达军工混合
         "013566[军工]",  # 华夏军工混合
+        "015599[军工]",  # 国泰国证航天军工
         #医疗
         "006113[港股医药]",  # 汇添富创新药混合A
         "023482[港股医药]",  # 万家港股创新药
@@ -2543,6 +3210,9 @@ def get_monitor_funds(max_workers=10):
         "013416[医疗器械]",  # 永赢医疗器械
         "014565[港股医药]",  # 天弘沪深港创新药
         "020398[港股医药]",  # 中银沪港通创新药
+        "000591[医疗器械]",  # 中银健康生活
+        "001056[医疗器械]",  # 华银健康生活
+        "016018[医疗器械]",  # 银河康乐股票C
         #银行
         "016573[金融]",  # 招商银行AH
         "021980[金融]",  # 兴全红利量化选股股票C
@@ -2553,24 +3223,36 @@ def get_monitor_funds(max_workers=10):
         "004070[证券]",  # 南方中证全指证券公司ETF联接C
         "025194[证券]",  #银华中证全指证券公司ETF发起式联接C
         "012420[金融]",  # 广发价值领先混合C
+        "024074[金融]",  # 上银国证自由现金流
+        "001595[金融]",  # 天弘中证银行ETF联接C
         #通信
         "022365[通信]",  # 永赢智选混合
         "025422[通信]",  # 浦银安盛数字经济混合
         "018291[通信]",  # 广发新兴成长混合C
         "021717[云计算]",  # 招商云计算ETF
         "019170[云计算]",  # 天弘沪港深云计算
+        "023881[科技]",  # 兴全商业模式混合(LOF)C
         "014819[科技]",  # 国金新兴价值混合
-        "014422[科技]",  # 弘毅消费混合
         "377240[科技]",  # 摩根新兴动力混合
+        "024203[科技]",  # 永赢制造升级混合
+        "016387[科技]",  # 永赢低碳环保智选混
+        "021536[科技]",  # 天弘中证软件服务指数发起C
+        "025784[科技]",  # 兴证资管金麒麟兴享优选混合E
         "018994[通信]",  # 中欧数字经济混合
         "021989[通信]",  # 银河中证通信
         "021934[通信]",  # 富国中证通信
         "020900[通信]",  # 天弘中证全指通信设备指数发起C
         "024195[通信]",  # 永赢国证商用卫星通信产业ETF发起联接C
+        "025491[通信]",  # 平安中证卫星产业指数C
+        "024749[通信]",  # 博时中证卫星产品指数C
+        "009854[通信]",  # 中加优势企业混合C
+        "014422[人工智能]",  # 弘毅消费混合
         "011840[人工智能]",  # 天弘中证人工智能C
         "012734[人工智能]",  # 易方达人工智能ETF联接C
         "023565[人工智能]",  # 易方达科创人工智能ETF联接C
         "024663[人工智能]",  # 富国创业板人工智能
+        "012183[人工智能]",  # 广发沪港深精选混合
+        "023754[人工智能]",  # 永赢信息产业智选混合
         #机器人
         "020256[机器人]",  # 中欧机器人
         "020973[机器人]",  # 易方达机器人
@@ -2578,6 +3260,7 @@ def get_monitor_funds(max_workers=10):
         "018125[机器人]",  # 永赢制造混合
         "020608[机器人]",  # 南方中证机器人ETF发起联接C
         "001864[机器人]",  # 中海长江三角混合
+        "020982[机器人]",  # 华安国证机器人
         #量化
         "014806[量化]",  # 国金量化混合
         "020902[量化]",  # 招商量化选股
@@ -2585,35 +3268,55 @@ def get_monitor_funds(max_workers=10):
         "017647[新能源]",  # 易方达光伏
         "018419[新能源]",  # 广发碳中和混合
         "011103[新能源]",  # 光天弘中证光伏
+        "023852[新能源]",  # 富国上证科创板新能源ETF发起式联接C
+        
         "015528[新能源汽车]",  # 弘毅汽车混合
         "017223[储能]",  # 富国中证电池主题ETF发起式联接C
         "013180[储能]",  # 广发国证新能源车电池ETF联接C
         "290014[储能]",  # 泰信现代服务业混合
+        "018173[储能]",  # 华泰柏瑞中证电力全指ETF发起式联接C
+        "025857[储能]",  # 华夏中证电网设备
+        "024738[储能]",  # 永赢新材料智选混合发起C
+        "023159[储能]",  # 上银先进制造混合发起式C
         #传统能源
         "016814[传统能源]",  # 国联中证煤炭
         "013275[传统能源]",  # 富国中证煤炭指数(LOF)C
+        "023145[传统能源]",  # 汇添富中证油气资源ETF发起式联接C
+        "021856[传统能源]",  # 博时中证油气资源ETF发起式联接C
         "015897[化工]",  # 天弘中证化工
+        "022328[化工]",  # 宏利高端装备股票C
         "018647[家用电器]",  # 易方达家电龙头
-        "017227[家用电器]",  # 富国中证全指家用电器ETF发起式联接C
         "011036[稀土]",  # 嘉实中证稀土
         "017193[有色金属]",  # 天弘中证工业有色金属主题指数发起C
+        "019875[有色金属]",  # 广发中证稀有金属
+        "016708[有色金属]",  # 华夏有色金属ETF联接C
+        "017141[有色金属]",  # 华宝中证有色金属
         "023037[有色金属]",  # 中欧资源精选混合发起C
         "023449[有色金属]",  # 上银资源精选混合发起C
+        "161715[有色金属]",  # 招商大宗商品(LOF)
         "012725[畜牧养殖]",  # 国泰畜牧养殖
+        "010770[农业]",  # 天弘中证农业主题ETF联接C
+        "020651[农业]",  # 博时国证粮食产业指数发起式C
         #黄金
         "021959[贵金属]",  # 南方沪深港黄金
         "020412[贵金属]",  # 永赢沪深港黄金
         "008987[贵金属]",  # 广发上海金ETF联接C
         "016582[贵金属]",  # 嘉实上海金ETF联接C
         "000217[贵金属]",  # 华安黄金ETF联接C
+        "002963[贵金属]",  # 易方达黄金ETF联接C
         "025446[贵金属]",  # 万家周期视野股票C
         #消费
         "012341[消费]",  # 东财食品饮料指数
         "017870[消费]",  # 光大消费主题股票C
         "018650[消费]",  # 兴银消费混合
+        "012414[消费]",  # 招商中证白酒指数
         "018897[消费电子]",  # 易方达消费电子ETF联接C
         "016008[消费电子]",  # 招商中证消费电子主题ETF联接C
         "012769[传媒]",  # 华夏中证动漫游戏ETF发起式联接C
+        "001223[传媒]",  # 鹏华文化传媒娱乐股票
+        "010677[传媒]",  # 工银瑞信中证传媒
+        "004753[传媒]",  # 广发中证传媒
+        "016550[传媒]",  # 永赢消费龙头智选混合发起C
         #半导体
         "019571[半导体]",  # 诺安配置混合
         "001665[半导体]",  # 平安鑫安混合
@@ -2622,12 +3325,21 @@ def get_monitor_funds(max_workers=10):
         "023829[半导体]",  # 万家中证半导体材料设备主题
         "020671[半导体]",  # 易方达科创板芯片
         "020629[半导体]",  # 汇添富上证科创板芯片ETF联接C
+        "011120[半导体]",  # 富国创新科技混合
+        "013613[半导体]",  # 宝盈国家安全沪港深股票C
+        "013446[半导体]",  # 东财芯片C
+        "016874[半导体]",  # 广发远见智选混合
+        "020640[半导体]",  # 广发半导体设备ETF联接C
+        "007639[半导体]",  # 汇添富竞争优势灵活配置
+        "020227[半导体]",  # 国泰中证全指集成电路ETF发起式联接C
+        "009883[半导体]",  # 华润元大核心动力混合C
         #指数
         "022435[指数型]",  # 南方中证500
         "022486[指数型]",  # 国金中证A500
         "019919[指数型]",  # 招商中证2000
         "021172[指数型]",  # 华安北证50
-        "023887[指数型]",  # 永赢北证50
+        "017518[指数型]",  # 招商北证50
+        "025444[指数型]",  # 景顺长城北证50
         "011613[指数型]",  # 华夏科创50
         "023051[指数型]",  # 交银科创100
         "023896[指数型]",  # 天弘科创综合
@@ -2642,7 +3354,9 @@ def get_monitor_funds(max_workers=10):
         "021378[港股科技]",  # 兴业港股通互联网
         "013172[港股科技]",  # 华夏恒生互联网
         #灵活混合
+        "002834[混合型]",  # 华夏新锦绣混合C
         "002833[混合型]",  # 华夏锦绣混合
+        "019374[混合型]",  # 广发睿杰精选混合发起式A
         #债基
         "003547[债券型]",  # 鹏华丰禄债券
         "018598[债券型]",  # 兴全招益债券
@@ -2676,15 +3390,49 @@ def get_monitor_funds(max_workers=10):
             
             category = tracker.classifier.classify_fund(fund_name, original_fund_code)
             
+            # 检查估算净值日期是否与当前交易日一致
+            # 如果日期不一致（如港股闭市），使用最新净值作为估算净值，涨跌幅设为0
+            gztime = fund_info.get("gztime", "")
+            today = datetime.now().strftime('%Y-%m-%d')
+            dwjz = fund_info.get("dwjz", "N/A")
+            gsz = fund_info.get("gsz", "N/A")
+            gszzl = fund_info.get("gszzl", "N/A")
+            
+            # 提取估算净值日期（从 gztime 中提取日期部分）
+            estimate_date = None
+            if gztime and gztime != "N/A":
+                try:
+                    # gztime 格式可能是 "YYYY-MM-DD HH:mm" 或 "YYYY-MM-DD"
+                    if ' ' in gztime:
+                        estimate_date = gztime.split(' ')[0]
+                    else:
+                        estimate_date = gztime
+                except:
+                    pass
+            
+            # 如果估算净值日期不是今天，且最新净值有效，则使用最新净值
+            if estimate_date and estimate_date != today:
+                if dwjz != "N/A" and dwjz != "" and dwjz != "NaN" and dwjz != "null":
+                    try:
+                        # 验证最新净值是有效数字
+                        float(dwjz)
+                        gsz = dwjz  # 使用最新净值作为估算净值
+                        gszzl = "0.00"  # 涨跌幅设为0
+                        # 保持 gztime 为当前日期（用于列头显示），但实际净值是上日的
+                        gztime = f"{today} 15:00"
+                        log_debug(f"📅 {fund_name} ({fund_code}) 估算净值日期({estimate_date})非今日，使用最新净值({dwjz})，涨跌幅设为0")
+                    except (ValueError, TypeError):
+                        pass  # 如果最新净值无效，保持原值
+            
             fund_item = {
                 "基金代码": fund_code,
                 "基金名称": fund_name,
                 "板块分类": category,
-                "最新净值": fund_info.get("dwjz", "N/A"),
-                "估算净值": fund_info.get("gsz", "N/A"),
-                "估算涨跌率": fund_info.get("gszzl", "N/A"),
+                "最新净值": dwjz,
+                "估算净值": gsz,
+                "估算涨跌率": gszzl,
                 "净值日期": fund_info.get("jzrq", "N/A"),
-                "估值时间": fund_info.get("gztime", "N/A")
+                "估值时间": gztime
             }
             monitor_fund_data.append(fund_item)
     
@@ -2820,6 +3568,33 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
         .tab-content.active {{
             display: block;
         }}
+        .search-box {{
+            margin: 15px 0;
+            padding: 10px;
+            background-color: #f8f9fa;
+            border-radius: 8px;
+            border: 1px solid #dee2e6;
+        }}
+        .search-box input {{
+            width: 100%;
+            padding: 10px 15px;
+            font-size: 14px;
+            border: 1px solid #ced4da;
+            border-radius: 6px;
+            box-sizing: border-box;
+            transition: border-color 0.3s;
+        }}
+        .search-box input:focus {{
+            outline: none;
+            border-color: #007bff;
+            box-shadow: 0 0 0 3px rgba(0, 123, 255, 0.1);
+        }}
+        .search-box input::placeholder {{
+            color: #6c757d;
+        }}
+        .fund-row.hidden {{
+            display: none;
+        }}
         table {{
             width: 100%;
             border-collapse: collapse;
@@ -2832,6 +3607,48 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
             padding: 12px 8px;
             text-align: center;
             font-weight: bold;
+            position: relative;
+        }}
+        th.sortable {{
+            cursor: pointer;
+            user-select: none;
+        }}
+        th.sortable:hover {{
+            background-color: #0056b3;
+        }}
+        .sort-icons {{
+            display: inline-flex;
+            flex-direction: column;
+            margin-left: 5px;
+            vertical-align: middle;
+            line-height: 1;
+        }}
+        .sort-icon {{
+            display: inline-block;
+            font-size: 8px;
+            cursor: pointer;
+            opacity: 0.5;
+            transition: opacity 0.3s, color 0.3s;
+            color: rgba(255, 255, 255, 0.5);
+            user-select: none;
+        }}
+        .sort-icon:hover {{
+            opacity: 1;
+            color: white;
+        }}
+        .sort-icon.asc-active {{
+            opacity: 1;
+            color: white;
+        }}
+        .sort-icon.desc-active {{
+            opacity: 1;
+            color: white;
+        }}
+        .sort-icon-asc {{
+            margin-bottom: 1px;
+        }}
+        .sort-icon-desc {{
+            margin-top: 1px;
         }}
         td {{
             padding: 10px 8px;
@@ -3052,6 +3869,10 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
             background-color: #8bc34a;  /* 浅绿色 */
             color: #2e7d32;
         }}
+        .category-农业 {{
+            background-color: #8bc34a;  /* 浅绿色 */
+            color: #2e7d32;
+        }}
         .category-证券 {{
             background-color: #9c27b0;  /* 紫色 */
             color: #fff;
@@ -3248,19 +4069,22 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
         .info-row {{
             margin: 8px 0;
             display: flex;
-            justify-content: flex-start;
+            justify-content: space-between;
             align-items: center;
             padding: 4px 0;
-            gap: 20px;
+            gap: 15px;
         }}
         .info-item {{
             flex: 1;
             text-align: left;
+            min-width: 0;
         }}
         .info-label {{
             color: #666;
             font-size: 14px;
             font-weight: 500;
+            display: inline-block;
+            min-width: 70px;
         }}
         .info-value {{
             color: #333;
@@ -3269,7 +4093,7 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
         }}
         .nav-value {{
             color: #007bff;
-            font-size: 16px;
+            font-size: 14px;
             font-weight: bold;
         }}
         .cost-value {{
@@ -3398,11 +4222,19 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
                             <span class="info-label">单位净值:</span>
                             <span class="nav-value" id="unitNav">-</span>
                         </div>
-                    </div>
-                    <div class="info-row">
                         <div class="info-item">
                             <span class="info-label">涨跌幅:</span>
                             <span class="info-value" id="changeRate">-</span>
+                        </div>
+                    </div>
+                    <div class="info-row">
+                        <div class="info-item">
+                            <span class="info-label">份额变动:</span>
+                            <span class="info-value" id="sharesChange">-</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label">变动金额:</span>
+                            <span class="info-value" id="changeAmount">-</span>
                         </div>
                         <div class="info-item">
                             <span class="info-label">持仓成本:</span>
@@ -3439,6 +4271,9 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
             
             <div id="monitor" class="tab-content active">
                 <h3>监控基金</h3>
+                <div class="search-box">
+                    <input type="text" id="search-monitor" placeholder="搜索基金代码、基金名称或板块..." oninput="filterFunds('monitor', this.value)">
+                </div>
                 <table>
                     <thead>
                         <tr>
@@ -3447,7 +4282,7 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
                             <th>板块分类</th>
                             <th>最新净值<br><span style="font-size: 14px; color: #ffffff; background-color: #007bff; padding: 2px 6px; border-radius: 4px; display: inline-block; margin-top: 4px;">{latest_date_header}</span></th>
                             <th>估算净值<br><span style="font-size: 12px; color: #ffffff; background-color: #007bff; padding: 2px 6px; border-radius: 4px; display: inline-block; margin-top: 4px;">{estimate_date_header}</span></th>
-                            <th>估算涨跌率</th>
+                            <th class="sortable" onclick="if(!event.target.classList.contains('sort-icon')) sortTableByHeader('monitor', 5, this)">估算涨跌率<span class="sort-icons"><span class="sort-icon sort-icon-asc" onclick="event.stopPropagation(); sortTableByIcon('monitor', 5, 'asc', this);">▲</span><span class="sort-icon sort-icon-desc" onclick="event.stopPropagation(); sortTableByIcon('monitor', 5, 'desc', this);">▼</span></span></th>
                         </tr>
                     </thead>
                     <tbody>
@@ -3458,6 +4293,9 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
             
             <div id="chaochao" class="tab-content">
                 <h3>钞钞的基金</h3>
+                <div class="search-box">
+                    <input type="text" id="search-chaochao" placeholder="搜索基金代码、基金名称或板块..." oninput="filterFunds('chaochao', this.value)">
+                </div>
                 <table>
                     <thead>
                         <tr>
@@ -3466,11 +4304,11 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
                             <th>板块分类</th>
                             <th>最新净值<br><span style="font-size: 14px; color: #ffffff; background-color: #007bff; padding: 2px 6px; border-radius: 4px; display: inline-block; margin-top: 4px;">{latest_date_header}</span></th>
                             <th>估算净值<br><span style="font-size: 14px; color: #ffffff; background-color: #007bff; padding: 2px 6px; border-radius: 4px; display: inline-block; margin-top: 4px;">{estimate_date_header}</span></th>
-                            <th>估算涨跌率</th>
+                            <th class="sortable" onclick="if(!event.target.classList.contains('sort-icon')) sortTableByHeader('chaochao', 5, this)">估算涨跌率<span class="sort-icons"><span class="sort-icon sort-icon-asc" onclick="event.stopPropagation(); sortTableByIcon('chaochao', 5, 'asc', this);">▲</span><span class="sort-icon sort-icon-desc" onclick="event.stopPropagation(); sortTableByIcon('chaochao', 5, 'desc', this);">▼</span></span></th>
                             <th>成本单价</th>
-                            <th>当日收益</th>
-                            <th>持仓收益</th>
-                            <th>持仓收益率</th>
+                            <th class="sortable" onclick="if(!event.target.classList.contains('sort-icon')) sortTableByHeader('chaochao', 7, this)">当日收益<span class="sort-icons"><span class="sort-icon sort-icon-asc" onclick="event.stopPropagation(); sortTableByIcon('chaochao', 7, 'asc', this);">▲</span><span class="sort-icon sort-icon-desc" onclick="event.stopPropagation(); sortTableByIcon('chaochao', 7, 'desc', this);">▼</span></span></th>
+                            <th class="sortable" onclick="if(!event.target.classList.contains('sort-icon')) sortTableByHeader('chaochao', 8, this)">持仓收益<span class="sort-icons"><span class="sort-icon sort-icon-asc" onclick="event.stopPropagation(); sortTableByIcon('chaochao', 8, 'asc', this);">▲</span><span class="sort-icon sort-icon-desc" onclick="event.stopPropagation(); sortTableByIcon('chaochao', 8, 'desc', this);">▼</span></span></th>
+                            <th class="sortable" onclick="if(!event.target.classList.contains('sort-icon')) sortTableByHeader('chaochao', 9, this)">持仓收益率<span class="sort-icons"><span class="sort-icon sort-icon-asc" onclick="event.stopPropagation(); sortTableByIcon('chaochao', 9, 'asc', this);">▲</span><span class="sort-icon sort-icon-desc" onclick="event.stopPropagation(); sortTableByIcon('chaochao', 9, 'desc', this);">▼</span></span></th>
                         </tr>
                     </thead>
                     <tbody>
@@ -3481,6 +4319,9 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
             
             <div id="yaoyao" class="tab-content">
                 <h3>垚垚的基金</h3>
+                <div class="search-box">
+                    <input type="text" id="search-yaoyao" placeholder="搜索基金代码、基金名称或板块..." oninput="filterFunds('yaoyao', this.value)">
+                </div>
                 <table>
                     <thead>
                         <tr>
@@ -3489,11 +4330,11 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
                             <th>板块分类</th>
                             <th>最新净值<br><span style="font-size: 14px; color: #ffffff; background-color: #007bff; padding: 2px 6px; border-radius: 4px; display: inline-block; margin-top: 4px;">{latest_date_header}</span></th>
                             <th>估算净值<br><span style="font-size: 14px; color: #ffffff; background-color: #007bff; padding: 2px 6px; border-radius: 4px; display: inline-block; margin-top: 4px;">{estimate_date_header}</span></th>
-                            <th>估算涨跌率</th>
+                            <th class="sortable" onclick="if(!event.target.classList.contains('sort-icon')) sortTableByHeader('yaoyao', 5, this)">估算涨跌率<span class="sort-icons"><span class="sort-icon sort-icon-asc" onclick="event.stopPropagation(); sortTableByIcon('yaoyao', 5, 'asc', this);">▲</span><span class="sort-icon sort-icon-desc" onclick="event.stopPropagation(); sortTableByIcon('yaoyao', 5, 'desc', this);">▼</span></span></th>
                             <th>成本单价</th>
-                            <th>当日收益</th>
-                            <th>持仓收益</th>
-                            <th>持仓收益率</th>
+                            <th class="sortable" onclick="if(!event.target.classList.contains('sort-icon')) sortTableByHeader('yaoyao', 7, this)">当日收益<span class="sort-icons"><span class="sort-icon sort-icon-asc" onclick="event.stopPropagation(); sortTableByIcon('yaoyao', 7, 'asc', this);">▲</span><span class="sort-icon sort-icon-desc" onclick="event.stopPropagation(); sortTableByIcon('yaoyao', 7, 'desc', this);">▼</span></span></th>
+                            <th class="sortable" onclick="if(!event.target.classList.contains('sort-icon')) sortTableByHeader('yaoyao', 8, this)">持仓收益<span class="sort-icons"><span class="sort-icon sort-icon-asc" onclick="event.stopPropagation(); sortTableByIcon('yaoyao', 8, 'asc', this);">▲</span><span class="sort-icon sort-icon-desc" onclick="event.stopPropagation(); sortTableByIcon('yaoyao', 8, 'desc', this);">▼</span></span></th>
+                            <th class="sortable" onclick="if(!event.target.classList.contains('sort-icon')) sortTableByHeader('yaoyao', 9, this)">持仓收益率<span class="sort-icons"><span class="sort-icon sort-icon-asc" onclick="event.stopPropagation(); sortTableByIcon('yaoyao', 9, 'asc', this);">▲</span><span class="sort-icon sort-icon-desc" onclick="event.stopPropagation(); sortTableByIcon('yaoyao', 9, 'desc', this);">▼</span></span></th>
                         </tr>
                     </thead>
                     <tbody>
@@ -3504,6 +4345,9 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
             
             <div id="overseas" class="tab-content">
                 <h3>境外基金</h3>
+                <div class="search-box">
+                    <input type="text" id="search-overseas" placeholder="搜索基金代码、基金名称或板块..." oninput="filterFunds('overseas', this.value)">
+                </div>
                 <table>
                     <thead>
                         <tr>
@@ -3512,7 +4356,7 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
                             <th>板块分类</th>
                             <th>最新净值</th>
                             <th>上日净值</th>
-                            <th>涨跌幅</th>
+                            <th class="sortable" onclick="if(!event.target.classList.contains('sort-icon')) sortTableByHeader('overseas', 5, this)">涨跌幅<span class="sort-icons"><span class="sort-icon sort-icon-asc" onclick="event.stopPropagation(); sortTableByIcon('overseas', 5, 'asc', this);">▲</span><span class="sort-icon sort-icon-desc" onclick="event.stopPropagation(); sortTableByIcon('overseas', 5, 'desc', this);">▼</span></span></th>
                         </tr>
                     </thead>
                     <tbody>
@@ -3523,6 +4367,9 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
             
             <div id="etf" class="tab-content">
                 <h3>场内基金</h3>
+                <div class="search-box">
+                    <input type="text" id="search-etf" placeholder="搜索基金代码、基金名称或板块..." oninput="filterFunds('etf', this.value)">
+                </div>
                 <table>
                     <thead>
                         <tr>
@@ -3531,7 +4378,7 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
                             <th>板块分类</th>
                             <th>最新净价<br><span style="font-size: 12px; color: #ffffff; background-color: #007bff; padding: 2px 6px; border-radius: 4px; display: inline-block; margin-top: 4px;">{etf_latest_time_header}</span></th>
                             <th>上日净价<br><span style="font-size: 14px; color: #ffffff; background-color: #007bff; padding: 2px 6px; border-radius: 4px; display: inline-block; margin-top: 4px;">{etf_prev_date_header}</span></th>
-                            <th>涨跌率</th>
+                            <th class="sortable" onclick="if(!event.target.classList.contains('sort-icon')) sortTableByHeader('etf', 5, this)">涨跌率<span class="sort-icons"><span class="sort-icon sort-icon-asc" onclick="event.stopPropagation(); sortTableByIcon('etf', 5, 'asc', this);">▲</span><span class="sort-icon sort-icon-desc" onclick="event.stopPropagation(); sortTableByIcon('etf', 5, 'desc', this);">▼</span></span></th>
                         </tr>
                     </thead>
                     <tbody>
@@ -3543,7 +4390,7 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
     </div>
     
     <script>
-        // API 基址自动探测与可配置（支持 ?api= 覆盖与 localStorage 持久化）
+        // API 基址自动探测与可配置（支持 ?api= 覆盖与 localStorage 持久化，支持 HTTP/HTTPS 协议自动检测）
         (function() {{
             function resolveApiBase() {{
                 try {{
@@ -3572,9 +4419,29 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
                     }}
                 }} catch (e) {{}}
                 // 本地文件或未知协议下的回退
+                // 根据当前页面协议决定使用 HTTP 还是 HTTPS
+                var currentProtocol = window.location.protocol || 'http:';
+                if (currentProtocol === 'https:') {{
+                    return 'https://127.0.0.1:5000';
+                }}
                 return 'http://127.0.0.1:5000';
             }}
             window.API_BASE = (resolveApiBase() || '').replace(/\\/$/, '');
+            
+            // 协议检测和切换函数
+            window.getApiUrlWithProtocolCheck = function(endpoint) {{
+                var baseUrl = window.API_BASE;
+                if (!baseUrl) {{
+                    return null;
+                }}
+                // 如果 API_BASE 已经包含协议，直接使用
+                if (/^https?:\\/\\//i.test(baseUrl)) {{
+                    return baseUrl + endpoint;
+                }}
+                // 否则根据当前页面协议添加协议
+                var protocol = window.location.protocol || 'http:';
+                return protocol + '//' + baseUrl.replace(/^https?:\\/\\//i, '') + endpoint;
+            }};
         }})();
         function showTab(tabName) {{
             // 隐藏所有tab内容
@@ -3595,6 +4462,255 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
             // 添加active类到选中的按钮
             event.target.classList.add('active');
         }}
+        
+        // 搜索功能：模糊匹配基金代码、基金名称、板块，支持关键词筛选（红、绿、涨、跌）
+        function filterFunds(tabName, searchText) {{
+            var tabContent = document.getElementById(tabName);
+            if (!tabContent) return;
+            
+            var table = tabContent.querySelector('table');
+            if (!table) return;
+            
+            var rows = table.querySelectorAll('tbody tr.fund-row');
+            var searchLower = searchText.toLowerCase().trim();
+            
+            if (searchLower === '') {{
+                // 如果搜索框为空，显示所有行
+                rows.forEach(function(row) {{
+                    row.classList.remove('hidden');
+                }});
+                return;
+            }}
+            
+            // 确定涨跌幅/率列的索引
+            var changeRateColIndex = -1;
+            if (tabName === 'monitor' || tabName === 'overseas' || tabName === 'etf') {{
+                changeRateColIndex = 5; // 估算涨跌率/涨跌幅/涨跌率
+            }} else if (tabName === 'chaochao' || tabName === 'yaoyao') {{
+                changeRateColIndex = 5; // 估算涨跌率
+            }}
+            
+            rows.forEach(function(row) {{
+                // 获取基金代码（第一列）
+                var codeCell = row.cells[0];
+                var code = codeCell ? codeCell.textContent.trim().toLowerCase() : '';
+                
+                // 获取基金名称（第二列）
+                var nameCell = row.cells[1];
+                var name = nameCell ? nameCell.textContent.trim().toLowerCase() : '';
+                
+                // 获取板块分类（第三列）
+                var categoryCell = row.cells[2];
+                var category = '';
+                if (categoryCell) {{
+                    var categoryTag = categoryCell.querySelector('.category-tag');
+                    category = categoryTag ? categoryTag.textContent.trim().toLowerCase() : '';
+                }}
+                
+                // 检查关键词筛选（红、绿、涨、跌）
+                var keywordMatch = true; // 默认为true，如果没有关键词则不影响
+                var hasKeyword = false;
+                var keywordText = '';
+                
+                if (changeRateColIndex >= 0) {{
+                    var changeRateCell = row.cells[changeRateColIndex];
+                    if (changeRateCell) {{
+                        var changeRateText = changeRateCell.textContent.trim();
+                        var changeRateValue = parseFloat(changeRateText.replace(/[+%]/g, ''));
+                        
+                        // 检查是否包含关键词
+                        if (searchLower.includes('红') || searchLower.includes('涨')) {{
+                            hasKeyword = true;
+                            keywordMatch = !isNaN(changeRateValue) && changeRateValue > 0;
+                            keywordText = searchLower.replace(/[红涨]/g, '').trim();
+                        }} else if (searchLower.includes('绿') || searchLower.includes('跌')) {{
+                            hasKeyword = true;
+                            keywordMatch = !isNaN(changeRateValue) && changeRateValue < 0;
+                            keywordText = searchLower.replace(/[绿跌]/g, '').trim();
+                        }}
+                    }}
+                }}
+                
+                // 模糊匹配：检查搜索文本是否包含在基金代码、基金名称或板块中
+                var searchTextForMatch = hasKeyword ? keywordText : searchLower;
+                var textMatch = true;
+                if (searchTextForMatch) {{
+                    textMatch = code.includes(searchTextForMatch) || 
+                               name.includes(searchTextForMatch) || 
+                               category.includes(searchTextForMatch);
+                }}
+                
+                // 如果有关键词，需要同时满足关键词和文本匹配；否则只检查文本匹配
+                var match = hasKeyword ? (keywordMatch && textMatch) : textMatch;
+                
+                if (match) {{
+                    row.classList.remove('hidden');
+                }} else {{
+                    row.classList.add('hidden');
+                }}
+            }});
+        }}
+        
+        // 排序功能
+        var sortStates = {{}}; // 存储每个表格的排序状态 {{tabName: {{colIndex: 'asc'|'desc'|null}}}}
+        var originalOrders = {{}}; // 存储每个表格的原始行顺序 {{tabName: [row1, row2, ...]}}
+        
+        // 通用的排序执行函数
+        function executeSort(tabName, colIndex, sortDirection, headerElement) {{
+            var tabContent = document.getElementById(tabName);
+            if (!tabContent) return;
+            
+            var table = tabContent.querySelector('table');
+            if (!table) return;
+            
+            var tbody = table.querySelector('tbody');
+            if (!tbody) return;
+            
+            // 初始化排序状态
+            if (!sortStates[tabName]) {{
+                sortStates[tabName] = {{}};
+            }}
+            
+            // 保存原始顺序（仅在第一次排序时保存）
+            if (!originalOrders[tabName]) {{
+                originalOrders[tabName] = tbody.innerHTML;
+            }}
+            
+            // 如果sortDirection为null，恢复原始顺序
+            if (sortDirection === null) {{
+                sortStates[tabName][colIndex] = null;
+                resetSortIcons(table);
+                tbody.innerHTML = originalOrders[tabName];
+                return;
+            }}
+            
+            // 更新排序状态
+            sortStates[tabName][colIndex] = sortDirection;
+            
+            // 重置所有排序图标
+            resetSortIcons(table);
+            
+            // 设置当前列的排序图标
+            var ascIcon = headerElement.querySelector('.sort-icon-asc');
+            var descIcon = headerElement.querySelector('.sort-icon-desc');
+            if (sortDirection === 'asc' && ascIcon) {{
+                ascIcon.classList.add('asc-active');
+            }} else if (sortDirection === 'desc' && descIcon) {{
+                descIcon.classList.add('desc-active');
+            }}
+            
+            // 获取所有行（排除汇总行）
+            var rows = Array.from(tbody.querySelectorAll('tr.fund-row'));
+            var summaryRow = tbody.querySelector('tr:not(.fund-row)');
+            
+            // 排序
+            rows.sort(function(a, b) {{
+                var aCell = a.cells[colIndex];
+                var bCell = b.cells[colIndex];
+                
+                if (!aCell || !bCell) return 0;
+                
+                var aText = aCell.textContent.trim();
+                var bText = bCell.textContent.trim();
+                
+                // 尝试解析为数字
+                var aNum = parseFloat(aText.replace(/[+¥,%]/g, ''));
+                var bNum = parseFloat(bText.replace(/[+¥,%]/g, ''));
+                
+                var aValue = isNaN(aNum) ? aText : aNum;
+                var bValue = isNaN(bNum) ? bText : bNum;
+                
+                if (aValue < bValue) return sortDirection === 'asc' ? -1 : 1;
+                if (aValue > bValue) return sortDirection === 'asc' ? 1 : -1;
+                return 0;
+            }});
+            
+            // 清空tbody并重新插入排序后的行
+            tbody.innerHTML = '';
+            rows.forEach(function(row) {{
+                tbody.appendChild(row);
+            }});
+            // 如果有汇总行，添加到最后
+            if (summaryRow) {{
+                tbody.appendChild(summaryRow);
+            }}
+        }}
+        
+        // 点击列头进行三态循环排序：null -> desc -> asc -> null
+        function sortTableByHeader(tabName, colIndex, headerElement) {{
+            var tabContent = document.getElementById(tabName);
+            if (!tabContent) return;
+            
+            var table = tabContent.querySelector('table');
+            if (!table) return;
+            
+            // 初始化排序状态
+            if (!sortStates[tabName]) {{
+                sortStates[tabName] = {{}};
+            }}
+            
+            // 获取当前排序状态
+            var currentSort = sortStates[tabName][colIndex] || null;
+            
+            // 三态循环：null -> desc -> asc -> null
+            var nextSort;
+            if (currentSort === null) {{
+                nextSort = 'desc';
+            }} else if (currentSort === 'desc') {{
+                nextSort = 'asc';
+            }} else {{
+                nextSort = null;
+            }}
+            
+            // 执行排序
+            executeSort(tabName, colIndex, nextSort, headerElement);
+        }}
+        
+        // 点击图标直接进行指定排序
+        function sortTableByIcon(tabName, colIndex, sortDirection, iconElement) {{
+            // 找到对应的表头元素
+            var tabContent = document.getElementById(tabName);
+            if (!tabContent) return;
+            
+            var table = tabContent.querySelector('table');
+            if (!table) return;
+            
+            var headers = table.querySelectorAll('th');
+            var headerElement = headers[colIndex];
+            
+            if (!headerElement) return;
+            
+            // 初始化排序状态
+            if (!sortStates[tabName]) {{
+                sortStates[tabName] = {{}};
+            }}
+            
+            // 获取当前排序状态
+            var currentSort = sortStates[tabName][colIndex] || null;
+            
+            // 如果点击的是当前已激活的排序方向，则取消排序
+            if (currentSort === sortDirection) {{
+                executeSort(tabName, colIndex, null, headerElement);
+            }} else {{
+                // 否则直接设置指定的排序方向
+                executeSort(tabName, colIndex, sortDirection, headerElement);
+            }}
+        }}
+        
+        // 重置所有排序图标
+        function resetSortIcons(table) {{
+            var allHeaders = table.querySelectorAll('th.sortable');
+            allHeaders.forEach(function(h) {{
+                var ascIcon = h.querySelector('.sort-icon-asc');
+                var descIcon = h.querySelector('.sort-icon-desc');
+                if (ascIcon) {{
+                    ascIcon.classList.remove('asc-active');
+                }}
+                if (descIcon) {{
+                    descIcon.classList.remove('desc-active');
+                }}
+            }});
+        }}
 
         // 弹框相关变量
         var modal = document.getElementById('fundModal');
@@ -3603,6 +4719,8 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
         var selectedFundCode = null;
         var selectedCostPrice = null;
         var selectedDays = 30;
+        var selectedUser = null;
+        var selectedTrades = [];
         var rangeButtons = null;
 
         // 关闭弹框
@@ -3626,8 +4744,8 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
         }}
 
         // 双击基金行显示弹框
-        function showFundDetail(fundCode, fundName, costPrice) {{
-            console.log('显示基金详情:', fundCode, fundName, costPrice);
+        function showFundDetail(fundCode, fundName, costPrice, user) {{
+            console.log('显示基金详情:', fundCode, fundName, costPrice, user);
             document.getElementById('modalTitle').textContent = fundName + ' (' + fundCode + ')';
             // 底部成本价区域已移除，改由悬浮提示
 
@@ -3638,6 +4756,8 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
             selectedFundCode = fundCode;
             selectedCostPrice = costPrice;
             selectedDays = 30;
+            selectedUser = user || null;
+            selectedTrades = [];
 
             // 绑定区间按钮
             rangeButtons = document.getElementsByClassName('range-btn');
@@ -3654,18 +4774,18 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
                         btn.classList.add('active');
                         var days = parseInt(btn.getAttribute('data-days')) || 30;
                         selectedDays = days;
-                        loadFundData(selectedFundCode, selectedCostPrice, selectedDays);
+                        loadFundData(selectedFundCode, selectedCostPrice, selectedDays, selectedUser);
                     }}
                 }})(rangeButtons[i]);
             }}
 
             // 加载净值数据和图表（默认1月）
-            loadFundData(fundCode, costPrice, selectedDays);
+            loadFundData(fundCode, costPrice, selectedDays, selectedUser);
         }}
 
-        // 加载基金数据
-        function loadFundData(fundCode, costPrice, days) {{
-            console.log('加载基金数据:', fundCode, costPrice);
+        // 加载基金数据（支持协议自动检测和切换）
+        function loadFundData(fundCode, costPrice, days, user) {{
+            console.log('加载基金数据:', fundCode, costPrice, user);
             days = days || 30;
             
             // 显示加载状态
@@ -3674,14 +4794,46 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
                 chartContainer.innerHTML = '<div style="text-align: center; padding: 50px; color: #666;">正在加载历史净值数据...</div>';
             }}
             
-            // 调用真实的历史净值API（近30天）- 使用可配置 API_BASE，支持 GitHub Pages 调用公网 HTTPS API
-            fetch(window.API_BASE + '/api/fund/history/' + fundCode + '?days=' + days)
-                .then(response => {{
-                    if (!response.ok) {{
-                        throw new Error(`HTTP ${{response.status}}`);
-                    }}
-                    return response.json();
-                }})
+            // 构建 API URL，支持协议检查
+            var apiUrl = window.getApiUrlWithProtocolCheck ? 
+                window.getApiUrlWithProtocolCheck('/api/fund/history/' + fundCode + '?days=' + days) :
+                (window.API_BASE + '/api/fund/history/' + fundCode + '?days=' + days);
+            
+            // 尝试获取数据，如果失败则尝试切换协议
+            function tryFetch(url, tryAlternateProtocol) {{
+                return fetch(url)
+                    .then(response => {{
+                        if (!response.ok) {{
+                            // 如果是 400 Bad Request 且可能是协议问题，尝试切换协议
+                            if (response.status === 400 && tryAlternateProtocol) {{
+                                var alternateUrl = url.replace(/^https?:/, url.startsWith('https:') ? 'http:' : 'https:');
+                                console.log('协议可能不匹配，尝试切换协议:', alternateUrl);
+                                return tryFetch(alternateUrl, false); // 只尝试一次
+                            }}
+                            throw new Error(`HTTP ${{response.status}}`);
+                        }}
+                        return response.json();
+                    }})
+                    .catch(error => {{
+                        // 如果是网络错误且是第一次尝试，尝试切换协议
+                        if (tryAlternateProtocol && (error.message.includes('Failed to fetch') || error.message.includes('NetworkError'))) {{
+                            var alternateUrl = url.replace(/^https?:/, url.startsWith('https:') ? 'http:' : 'https:');
+                            console.log('网络错误，尝试切换协议:', alternateUrl);
+                            return fetch(alternateUrl)
+                                .then(resp => {{
+                                    if (!resp.ok) throw new Error(`HTTP ${{resp.status}}`);
+                                    return resp.json();
+                                }})
+                                .catch(() => {{
+                                    throw error; // 如果切换协议也失败，抛出原始错误
+                                }});
+                        }}
+                        throw error;
+                    }});
+            }}
+            
+            // 调用真实的历史净值API（近30天）- 支持协议自动检测和切换
+            tryFetch(apiUrl, true)
                 .then(data => {{
                     if (data.success && data.data && data.data.length > 0) {{
                         console.log('获取到真实历史数据:', data);
@@ -3697,7 +4849,29 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
                             return new Date(a.date) - new Date(b.date);
                         }});
                         var label = '近' + (days === 30 ? '1月' : days === 90 ? '3月' : days === 180 ? '6月' : '1年') + '净值走势';
-                        displayChart(chartData, fundCode, costPrice, label);
+                        // 如果有用户信息且是个人持仓或QDII用户，尝试获取交易记录
+                        if (user && (user === 'chaochao' || user === 'yaoyao' || user === 'QDII')) {{
+                            var tradesUrl = window.getApiUrlWithProtocolCheck ? 
+                                window.getApiUrlWithProtocolCheck('/api/fund/trades/' + user + '/' + fundCode) :
+                                (window.API_BASE + '/api/fund/trades/' + user + '/' + fundCode);
+                            return fetch(tradesUrl)
+                                .then(resp => {{
+                                    if (!resp.ok) {{
+                                        throw new Error(`HTTP ${{resp.status}}`);
+                                    }}
+                                    return resp.json();
+                                }})
+                                .then(tradeData => {{
+                                    selectedTrades = tradeData.data || [];
+                                    displayChart(chartData, fundCode, costPrice, label, selectedTrades);
+                                }})
+                                .catch(err => {{
+                                    console.warn('交易记录获取失败，继续仅绘制净值:', err);
+                                    displayChart(chartData, fundCode, costPrice, label, []);
+                                }});
+                        }} else {{
+                            displayChart(chartData, fundCode, costPrice, label, []);
+                        }}
                     }} else {{
                         console.error('API返回数据为空:', data);
                         if (chartContainer) {{
@@ -3707,10 +4881,20 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
                 }})
                 .catch(error => {{
                     console.error('获取历史净值数据失败:', error);
+                    var errorMsg = '获取历史净值数据失败。<br/>';
+                    errorMsg += '当前 API_BASE: ' + (window.API_BASE || '(未设置)') + '<br/>';
+                    errorMsg += '尝试的 URL: ' + apiUrl + '<br/>';
+                    if (error.message.includes('400')) {{
+                        errorMsg += '<strong style="color: #f00;">检测到协议不匹配错误（400 Bad Request）。</strong><br/>';
+                        errorMsg += '请检查：<br/>';
+                        errorMsg += '1. 如果页面通过 HTTPS 打开，API 服务器需要支持 HTTPS<br/>';
+                        errorMsg += '2. 如果页面通过 HTTP 打开，API 服务器应使用 HTTP<br/>';
+                        errorMsg += '3. 可通过 URL 参数 ?api=http://或https://你的API地址 手动指定协议<br/>';
+                    }} else {{
+                        errorMsg += '如在 GitHub Pages，请在 URL 追加 ?api=https://你的API域名 或在本地打开后设置 localStorage.API_BASE';
+                    }}
                     if (chartContainer) {{
-                        chartContainer.innerHTML = '<div style="text-align: center; padding: 50px; color: #c00;">获取历史净值数据失败。<br/>'
-                          + '当前 API_BASE: ' + (window.API_BASE || '(未设置)') + '<br/>'
-                          + '如在 GitHub Pages，请在 URL 追加 ?api=https://你的API域名 或在本地打开后设置 localStorage.API_BASE</div>';
+                        chartContainer.innerHTML = '<div style="text-align: center; padding: 50px; color: #c00;">' + errorMsg + '</div>';
                     }}
                 }});
         }}
@@ -3720,8 +4904,43 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
         */
 
         // 显示图表
-        function displayChart(data, fundCode, costPrice, titleLabel) {{
-            console.log('开始绘制SVG图表:', data, fundCode, costPrice, titleLabel);
+        function displayChart(data, fundCode, costPrice, titleLabel, trades) {{
+            trades = trades || [];
+            console.log('开始绘制SVG图表:', data, fundCode, costPrice, titleLabel, trades);
+            
+            // 创建交易记录日期映射（用于快速查找）
+            // 注意：trades 已经通过 API 按基金代码过滤，所以这里只包含当前基金的交易记录
+            var tradesByDate = {{}};
+            var sortedDates = [];  // 提升到外层作用域，供后续使用
+            if (trades && trades.length > 0) {{
+                trades.forEach(function(trade) {{
+                    var date = trade.date;
+                    if (!tradesByDate[date]) {{
+                        tradesByDate[date] = [];
+                    }}
+                    tradesByDate[date].push(trade);
+                }});
+                sortedDates = Object.keys(tradesByDate).sort();
+            }}
+            
+            // 计算指定日期的份额变动（合计值）
+            // 支持同一天多种操作（如买入+卖出），会正确合计
+            function calculateSharesChange(dateStr) {{
+                if (!tradesByDate[dateStr] || tradesByDate[dateStr].length === 0) {{
+                    return null;
+                }}
+                var totalChange = 0;
+                tradesByDate[dateStr].forEach(function(trade) {{
+                    var action = (trade.action || '').toLowerCase();
+                    var shares = parseFloat(trade.shares) || 0;
+                    if (action === 'buy' || action === 'convert_in') {{
+                        totalChange += shares;  // 买入/转入为正
+                    }} else if (action === 'sell' || action === 'convert_out') {{
+                        totalChange -= shares;  // 卖出/转出为负
+                    }}
+                }});
+                return totalChange;
+            }}
             
             var chartContainer = document.getElementById('navChart');
             if (!chartContainer) {{
@@ -3837,10 +5056,14 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
                 points.push(x + ',' + y);
             }}
             
-            // 生成平滑曲线路径（使用二次贝塞尔曲线）
+            // 生成平滑曲线路径（使用二次贝塞尔曲线，保持圆滑）
             function buildSmoothPath(pts) {{
                 if (pts.length < 2) return '';
+                if (pts.length === 2) {{
+                    return 'M ' + pts[0] + ' L ' + pts[1];
+                }}
                 var d = 'M ' + pts[0];
+                // 使用平滑的二次贝塞尔曲线连接
                 for (var i = 0; i < pts.length - 1; i++) {{
                     var p = pts[i].split(',');
                     var x1 = parseFloat(p[0]);
@@ -3848,11 +5071,12 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
                     var p2 = pts[i + 1].split(',');
                     var x2 = parseFloat(p2[0]);
                     var y2 = parseFloat(p2[1]);
+                    // 使用中点作为控制点，创建平滑曲线
                     var mx = (x1 + x2) / 2;
                     var my = (y1 + y2) / 2;
                     d += ' Q ' + x1 + ' ' + y1 + ' ' + mx + ' ' + my;
                 }}
-                // 直达最后一个点
+                // 连接到最后一个点
                 d += ' L ' + pts[pts.length - 1];
                 return d;
             }}
@@ -3910,6 +5134,83 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
                 }}
             }}
             
+            // 绘制交易标记（买入/卖出/转换），如果有
+            if (trades && trades.length > 0) {{
+                var markersGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+                sortedDates.forEach(function(date) {{
+                    var dayTrades = tradesByDate[date];
+                    if (dayTrades.length === 0) return;
+                    
+                    try {{
+                        var tDate = new Date(date);
+                        // 精确匹配：优先查找完全匹配的日期
+                        var bestIdx = -1;
+                        var bestDiff = Infinity;
+                        for (var i = 0; i < data.length; i++) {{
+                            var dataDate = new Date(data[i].date);
+                            var diff = Math.abs(dataDate - tDate);
+                            // 优先完全匹配（diff为0）
+                            if (diff === 0) {{
+                                bestIdx = i;
+                                bestDiff = 0;
+                                break;
+                            }}
+                            if (diff < bestDiff) {{
+                                bestDiff = diff;
+                                bestIdx = i;
+                            }}
+                        }}
+                        
+                        // 如果找不到匹配点，使用第一个或最后一个
+                        if (bestIdx < 0) {{
+                            bestIdx = 0;
+                        }}
+                        if (bestIdx >= data.length) {{
+                            bestIdx = data.length - 1;
+                        }}
+                        
+                        // 使用points数组中对应索引的坐标，确保标记贴合曲线
+                        // points数组的构建方式与曲线路径一致
+                        if (bestIdx >= 0 && bestIdx < points.length) {{
+                            var point = points[bestIdx].split(',');
+                            var x = parseFloat(point[0]);
+                            var y = parseFloat(point[1]);
+                        }} else {{
+                            // 边界情况，使用计算值
+                            var x = paddingLeft + (bestIdx * chartWidth / (values.length - 1));
+                            var priceVal = parseFloat(data[bestIdx].nav);
+                            var y = paddingTop + ((maxValue - priceVal) * chartHeight / valueRange);
+                        }}
+                        
+                        // 确定颜色（同一天有多个交易时，优先显示买入/转入）
+                        var action = (dayTrades[0].action || '').toLowerCase();
+                        var hasBuy = dayTrades.some(function(t) {{ return t.action === 'buy' || t.action === 'convert_in'; }});
+                        var hasSell = dayTrades.some(function(t) {{ return t.action === 'sell' || t.action === 'convert_out'; }});
+                        
+                        var color = '#6c757d';
+                        if (hasBuy && hasSell) {{
+                            color = '#9c27b0';  // 同一天有买有卖，用紫色
+                        }} else if (hasBuy) {{
+                            color = '#007bff';  // 蓝色
+                        }} else if (hasSell) {{
+                            color = '#ff6b6b';  // 橙色
+                        }}
+                        
+                        var marker = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                        marker.setAttribute('cx', x);
+                        marker.setAttribute('cy', y);
+                        marker.setAttribute('r', 5);
+                        marker.setAttribute('fill', color);
+                        marker.setAttribute('stroke', '#ffffff');
+                        marker.setAttribute('stroke-width', '2');
+                        markersGroup.appendChild(marker);
+                    }} catch (e) {{
+                        console.warn('交易标记渲染失败:', e);
+                    }}
+                }});
+                svg.appendChild(markersGroup);
+            }}
+            
             // 添加X轴标签（使用抽样后的索引定位）
             for (var i = 0; i < labels.length; i++) {{
                 var x = paddingLeft + (labelIndices[i] * chartWidth / (values.length - 1));
@@ -3923,12 +5224,13 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
                 svg.appendChild(text);
             }}
             
-            // 曲线下方填充淡蓝色区域
+            // 曲线下方填充淡蓝色区域（使用与曲线相同的平滑路径）
             var areaPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-            var areaD = 'M ' + points[0] + ' ';
-            var smooth = buildSmoothPath(points);
-            areaD += smooth.replace(/^M [^Q]+/, '');
-            areaD += ' L ' + points[points.length - 1].split(',')[0] + ',' + (height - paddingBottom) + ' L ' + points[0].split(',')[0] + ',' + (height - paddingBottom) + ' Z';
+            var smoothPath = buildSmoothPath(points);
+            // 构建填充路径：曲线路径 + 底部边界 + 闭合
+            var firstPoint = points[0].split(',');
+            var lastPoint = points[points.length - 1].split(',');
+            var areaD = smoothPath + ' L ' + lastPoint[0] + ',' + (height - paddingBottom) + ' L ' + firstPoint[0] + ',' + (height - paddingBottom) + ' Z';
             areaPath.setAttribute('d', areaD);
             areaPath.setAttribute('fill', 'rgba(0,123,255,0.15)');
             areaPath.setAttribute('stroke', 'none');
@@ -3945,6 +5247,109 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
             title.textContent = titleLabel || '净值走势';
             svg.appendChild(title);
 
+            // 默认显示有交易记录的日期信息（优先显示最新交易日期）
+            function displayTradeInfoForDate(dateStr) {{
+                if (!dateStr || !tradesByDate[dateStr] || tradesByDate[dateStr].length === 0) {{
+                    return;
+                }}
+                
+                // 找到对应日期的数据点
+                var targetDate = new Date(dateStr);
+                var bestIdx = -1;
+                var bestDiff = Infinity;
+                for (var i = 0; i < data.length; i++) {{
+                    var dataDate = new Date(data[i].date);
+                    var diff = Math.abs(dataDate - targetDate);
+                    if (diff === 0) {{
+                        bestIdx = i;
+                        break;
+                    }}
+                    if (diff < bestDiff) {{
+                        bestDiff = diff;
+                        bestIdx = i;
+                    }}
+                }}
+                
+                if (bestIdx < 0 || bestIdx >= data.length) return;
+                
+                var currentData = data[bestIdx];
+                var currentNav = currentData.nav;
+                var currentDate = currentData.date;
+                
+                // 计算涨跌幅
+                var changePercent = '';
+                var changeClass = '';
+                if (bestIdx > 0) {{
+                    var prevNav = data[bestIdx - 1].nav;
+                    var change = ((currentNav - prevNav) / prevNav * 100);
+                    changePercent = (change >= 0 ? '+' : '') + change.toFixed(2) + '%';
+                    changeClass = change >= 0 ? 'positive' : 'negative';
+                }}
+                
+                // 计算份额变动和变动金额
+                var sharesChange = calculateSharesChange(dateStr);
+                var sharesChangeEl = document.getElementById('sharesChange');
+                var changeAmountEl = document.getElementById('changeAmount');
+                
+                // 更新信息显示
+                document.getElementById('transactionDate').textContent = currentDate;
+                document.getElementById('unitNav').textContent = currentNav.toFixed(4);
+                
+                if (changePercent) {{
+                    var changeElement = document.getElementById('changeRate');
+                    changeElement.textContent = changePercent;
+                    changeElement.className = 'info-value ' + changeClass;
+                }} else {{
+                    document.getElementById('changeRate').textContent = '-';
+                    document.getElementById('changeRate').className = 'info-value';
+                }}
+                
+                if (sharesChange !== null && sharesChange !== 0) {{
+                    var sign = sharesChange > 0 ? '+' : '';
+                    sharesChangeEl.textContent = sign + sharesChange.toFixed(2);
+                    sharesChangeEl.className = 'info-value ' + (sharesChange > 0 ? 'positive' : 'negative');
+                    
+                    var changeAmount = sharesChange * currentNav;
+                    changeAmountEl.textContent = (changeAmount >= 0 ? '+' : '') + changeAmount.toFixed(2);
+                    changeAmountEl.className = 'info-value ' + (changeAmount >= 0 ? 'positive' : 'negative');
+                }} else {{
+                    sharesChangeEl.textContent = '-';
+                    sharesChangeEl.className = 'info-value';
+                    changeAmountEl.textContent = '-';
+                    changeAmountEl.className = 'info-value';
+                }}
+                
+                // 更新持仓成本信息
+                if (costPrice && costPrice !== 'N/A') {{
+                    document.getElementById('holdingCost').textContent = parseFloat(costPrice).toFixed(4);
+                }}
+            }}
+            
+            // 默认显示最新交易日期（如果有交易记录）
+            if (sortedDates.length > 0) {{
+                // 找到最新交易日期对应的数据点
+                var latestTradeDate = sortedDates[sortedDates.length - 1];
+                displayTradeInfoForDate(latestTradeDate);
+            }} else {{
+                // 如果没有交易记录，显示最新净值数据
+                if (data.length > 0) {{
+                    var latestData = data[data.length - 1];
+                    document.getElementById('transactionDate').textContent = latestData.date;
+                    document.getElementById('unitNav').textContent = latestData.nav.toFixed(4);
+                    if (data.length > 1) {{
+                        var prevNav = data[data.length - 2].nav;
+                        var change = ((latestData.nav - prevNav) / prevNav * 100);
+                        var changePercent = (change >= 0 ? '+' : '') + change.toFixed(2) + '%';
+                        var changeElement = document.getElementById('changeRate');
+                        changeElement.textContent = changePercent;
+                        changeElement.className = 'info-value ' + (change >= 0 ? 'positive' : 'negative');
+                    }}
+                    if (costPrice && costPrice !== 'N/A') {{
+                        document.getElementById('holdingCost').textContent = parseFloat(costPrice).toFixed(4);
+                    }}
+                }}
+            }}
+            
             // 悬浮交互（动态显示虚线）
             svg.addEventListener('mouseleave', function() {{
                 hoverVerticalLine.style.opacity = 0;
@@ -3958,11 +5363,30 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
                     svg.removeChild(existingCircle);
                 }}
                 
-                // 重置信息显示区域
-                document.getElementById('transactionDate').textContent = '-';
-                document.getElementById('unitNav').textContent = '-';
-                document.getElementById('changeRate').textContent = '-';
-                document.getElementById('changeRate').className = 'info-value';
+                // 恢复默认显示（最新交易日期或最新净值）
+                if (sortedDates.length > 0) {{
+                    var latestTradeDate = sortedDates[sortedDates.length - 1];
+                    displayTradeInfoForDate(latestTradeDate);
+                }} else if (data.length > 0) {{
+                    var latestData = data[data.length - 1];
+                    document.getElementById('transactionDate').textContent = latestData.date;
+                    document.getElementById('unitNav').textContent = latestData.nav.toFixed(4);
+                    if (data.length > 1) {{
+                        var prevNav = data[data.length - 2].nav;
+                        var change = ((latestData.nav - prevNav) / prevNav * 100);
+                        var changePercent = (change >= 0 ? '+' : '') + change.toFixed(2) + '%';
+                        var changeElement = document.getElementById('changeRate');
+                        changeElement.textContent = changePercent;
+                        changeElement.className = 'info-value ' + (change >= 0 ? 'positive' : 'negative');
+                    }}
+                    document.getElementById('sharesChange').textContent = '-';
+                    document.getElementById('sharesChange').className = 'info-value';
+                    document.getElementById('changeAmount').textContent = '-';
+                    document.getElementById('changeAmount').className = 'info-value';
+                    if (costPrice && costPrice !== 'N/A') {{
+                        document.getElementById('holdingCost').textContent = parseFloat(costPrice).toFixed(4);
+                    }}
+                }}
             }});
             
             svg.addEventListener('mousemove', function(evt) {{
@@ -3979,25 +5403,47 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
                 var fIndex = ratio * (values.length - 1);
                 var idx = Math.round(fIndex); // 四舍五入到最近的数据点
                 
-                // 计算更精确的曲线位置（插值计算）
+                // 计算更精确的曲线位置
+                // 使用points数组中对应索引的坐标，确保悬浮圆贴合曲线
                 var exactX = cx;
                 var exactY;
                 
-                if (fIndex >= 0 && fIndex < values.length - 1) {{
-                    // 在两个数据点之间进行线性插值
+                if (idx >= 0 && idx < points.length) {{
+                    // 直接使用points数组中的坐标，确保与曲线路径一致
+                    var point = points[idx].split(',');
+                    exactX = parseFloat(point[0]);
+                    exactY = parseFloat(point[1]);
+                }} else if (fIndex >= 0 && fIndex < values.length - 1) {{
+                    // 在两个数据点之间进行线性插值（作为备选方案）
                     var idx1 = Math.floor(fIndex);
                     var idx2 = Math.ceil(fIndex);
                     var weight = fIndex - idx1;
                     
-                    var nav1 = data[idx1].nav;
-                    var nav2 = data[idx2].nav;
-                    var interpolatedNav = nav1 + (nav2 - nav1) * weight;
-                    
-                    exactY = paddingTop + ((maxValue - interpolatedNav) * chartHeight / valueRange);
+                    if (idx1 >= 0 && idx1 < points.length && idx2 >= 0 && idx2 < points.length) {{
+                        var p1 = points[idx1].split(',');
+                        var p2 = points[idx2].split(',');
+                        var x1 = parseFloat(p1[0]);
+                        var y1 = parseFloat(p1[1]);
+                        var x2 = parseFloat(p2[0]);
+                        var y2 = parseFloat(p2[1]);
+                        exactX = cx;
+                        exactY = y1 + (y2 - y1) * weight;
+                    }} else {{
+                        var nav1 = data[idx1].nav;
+                        var nav2 = data[idx2].nav;
+                        var interpolatedNav = nav1 + (nav2 - nav1) * weight;
+                        exactY = paddingTop + ((maxValue - interpolatedNav) * chartHeight / valueRange);
+                    }}
                 }} else {{
                     // 边界情况，使用最近的数据点
-                    var currentNav = data[idx].nav;
-                    exactY = paddingTop + ((maxValue - currentNav) * chartHeight / valueRange);
+                    if (idx >= 0 && idx < points.length) {{
+                        var point = points[idx].split(',');
+                        exactX = parseFloat(point[0]);
+                        exactY = parseFloat(point[1]);
+                    }} else {{
+                        var currentNav = data[idx].nav;
+                        exactY = paddingTop + ((maxValue - currentNav) * chartHeight / valueRange);
+                    }}
                 }}
                 
                 // 获取当前数据点信息
@@ -4065,6 +5511,26 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
                 // 更新持仓成本信息（如果鼠标移动时有成本价）
                 if (costPrice && costPrice !== 'N/A') {{
                     document.getElementById('holdingCost').textContent = parseFloat(costPrice).toFixed(4);
+                }}
+                
+                // 计算并显示份额变动和变动金额（仅显示当前日期的交易记录）
+                var sharesChange = calculateSharesChange(currentDate);
+                var sharesChangeEl = document.getElementById('sharesChange');
+                var changeAmountEl = document.getElementById('changeAmount');
+                if (sharesChange !== null && sharesChange !== 0) {{
+                    var sign = sharesChange > 0 ? '+' : '';
+                    sharesChangeEl.textContent = sign + sharesChange.toFixed(2);
+                    sharesChangeEl.className = 'info-value ' + (sharesChange > 0 ? 'positive' : 'negative');
+                    
+                    // 计算变动金额：份额变动 * 当日净值
+                    var changeAmount = sharesChange * currentNav;
+                    changeAmountEl.textContent = (changeAmount >= 0 ? '+' : '') + changeAmount.toFixed(2);
+                    changeAmountEl.className = 'info-value ' + (changeAmount >= 0 ? 'positive' : 'negative');
+                }} else {{
+                    sharesChangeEl.textContent = '-';
+                    sharesChangeEl.className = 'info-value';
+                    changeAmountEl.textContent = '-';
+                    changeAmountEl.className = 'info-value';
                 }}
                 
                 // 显示动态坐标轴标签
@@ -4168,7 +5634,7 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
             return "neutral"
     
     # 生成表格行的函数（用于自选基金，包含持仓信息）
-    def generate_table_rows(fund_list):
+    def generate_table_rows(fund_list, user_key):
         rows = ""
         total_today_profit = 0.0
         total_holdings_profit = 0.0
@@ -4285,7 +5751,7 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
             total_profit_rate_class = get_profit_color_class_for_table(total_profit_rate)
             
             rows += f"""
-                <tr class="fund-row" ondblclick="showFundDetail('{fund['基金代码']}', '{fund['基金名称']}', '{cost_price}')">
+                <tr class="fund-row" ondblclick="showFundDetail('{fund['基金代码']}', '{fund['基金名称']}', '{cost_price}', '{user_key}')">
                     <td>{fund['基金代码']}</td>
                     <td>{fund['基金名称']}</td>
                     <td><span class="category-tag category-{fund['板块分类']}">{fund['板块分类']}</span></td>
@@ -4377,7 +5843,7 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
                 estimate_time_display = ""
             
             rows += f"""
-                <tr class="fund-row" ondblclick="showFundDetail('{fund['基金代码']}', '{fund['基金名称']}', 'N/A')">
+                <tr class="fund-row" ondblclick="showFundDetail('{fund['基金代码']}', '{fund['基金名称']}', 'N/A', 'monitor')">
                     <td>{fund['基金代码']}</td>
                     <td>{fund['基金名称']}</td>
                     <td><span class="category-tag category-{fund['板块分类']}">{fund['板块分类']}</span></td>
@@ -4449,7 +5915,7 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
                     prev_date_display = ""
             
             rows += f"""
-                <tr class="fund-row" ondblclick="showFundDetail('{fund['基金代码']}', '{fund['基金名称']}', 'N/A')">
+                <tr class="fund-row" ondblclick="showFundDetail('{fund['基金代码']}', '{fund['基金名称']}', 'N/A', 'QDII')">
                     <td>{fund['基金代码']}</td>
                     <td>{fund['基金名称']}</td>
                     <td><span class="category-tag category-境外基金">境外基金</span></td>
@@ -4524,7 +5990,7 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
                     prev_date_display = jzrq
             
             rows += f"""
-                <tr class="fund-row" ondblclick="showFundDetail('{fund['基金代码']}', '{fund['基金名称']}', 'N/A')">
+                <tr class="fund-row" ondblclick="showFundDetail('{fund['基金代码']}', '{fund['基金名称']}', 'N/A', 'etf')">
                     <td>{fund['基金代码']}</td>
                     <td>{fund['基金名称']}</td>
                     <td><span class="category-tag category-ETF基金">ETF基金</span></td>
@@ -4751,8 +6217,8 @@ def save_to_html_multi_sheet(fund_data_dict, monitor_funds=None, filename=None, 
         estimate_date_header=estimate_date_header,
         etf_latest_time_header=etf_latest_time_header,
         etf_prev_date_header=etf_prev_date_header,
-        chaochao_table_rows=generate_table_rows(chaochao_data),
-        yaoyao_table_rows=generate_table_rows(yaoyao_data),
+            chaochao_table_rows=generate_table_rows(chaochao_data, 'chaochao'),
+            yaoyao_table_rows=generate_table_rows(yaoyao_data, 'yaoyao'),
         monitor_table_rows=generate_monitor_table_rows(monitor_data),
         overseas_table_rows=generate_overseas_table_rows(overseas_fund_data),
         etf_table_rows=generate_etf_table_rows(etf_fund_data)
@@ -5298,12 +6764,66 @@ def main():
             # 持仓收益计算模式
             calculate_holdings_profit()
             return
+        elif sys.argv[1] == "--import-trades":
+            # 从Excel导入交易记录模式
+            log_info("📥 从Excel导入交易记录...")
+            calculator = HoldingsProfitCalculator()
+            excel_file = sys.argv[2] if len(sys.argv) > 2 else 'trade_data.xlsx'
+            # 如果文件不存在，先创建模板
+            if not os.path.exists(excel_file):
+                log_info(f"📄 文件 {excel_file} 不存在，正在创建模板...")
+                calculator.create_trade_data_template(excel_file)
+                log_info("✅ 模板已创建，请填写交易记录后重新运行导入命令")
+                return
+            success = calculator.import_trades_from_excel(excel_file)
+            if success:
+                log_info("✅ 导入完成")
+            else:
+                log_info("❌ 导入失败")
+            return
+        elif sys.argv[1] == "--create-trade-template":
+            # 创建交易记录模板
+            log_info("📄 创建交易记录模板...")
+            calculator = HoldingsProfitCalculator()
+            excel_file = sys.argv[2] if len(sys.argv) > 2 else 'trade_data.xlsx'
+            success = calculator.create_trade_data_template(excel_file)
+            if success:
+                log_info(f"✅ 模板已创建: {excel_file}")
+            else:
+                log_info("❌ 创建模板失败")
+            return
+        elif sys.argv[1] == "--export-trades":
+            # 从JSON导出交易记录到Excel
+            log_info("📤 从JSON导出交易记录到Excel...")
+            calculator = HoldingsProfitCalculator()
+            excel_file = sys.argv[2] if len(sys.argv) > 2 else 'trade_data.xlsx'
+            success = calculator.export_trades_to_excel(excel_file)
+            if success:
+                log_info("✅ 导出完成")
+            else:
+                log_info("❌ 导出失败")
+            return
+        elif sys.argv[1] == "--restore-trades":
+            # 从备份恢复交易记录
+            log_info("🔄 从备份恢复交易记录...")
+            calculator = HoldingsProfitCalculator()
+            excel_file = sys.argv[2] if len(sys.argv) > 2 else 'trade_data.xlsx'
+            success = calculator.restore_trades_from_backup(excel_file)
+            if success:
+                log_info("✅ 恢复完成")
+            else:
+                log_info("❌ 恢复失败")
+            return
         elif sys.argv[1] == "--help":
             log_info("使用方法:")
-            log_info("  python combined_fund_tracker.py          # 标准模式：获取基金数据并生成报告")
-            log_info("  python combined_fund_tracker.py --update # 更新模式：更新基金净值")
-            log_info("  python combined_fund_tracker.py --profit # 收益模式：计算持仓收益")
-            log_info("  python combined_fund_tracker.py --help   # 显示帮助信息")
+            log_info("  python combined_fund_tracker.py                        # 标准模式：获取基金数据并生成报告")
+            log_info("  python combined_fund_tracker.py --update                # 更新模式：更新基金净值")
+            log_info("  python combined_fund_tracker.py --profit                # 收益模式：计算持仓收益")
+            log_info("  python combined_fund_tracker.py --import-trades [file]   # 从Excel全量导入交易记录到JSON（默认trade_data.xlsx）")
+            log_info("  python combined_fund_tracker.py --export-trades [file]   # 从JSON全量导出交易记录到Excel（默认trade_data.xlsx）")
+            log_info("  python combined_fund_tracker.py --create-trade-template [file] # 创建交易记录模板（默认trade_data.xlsx）")
+            log_info("  python combined_fund_tracker.py --restore-trades [file]  # 从备份恢复交易记录（默认trade_data.xlsx）")
+            log_info("  python combined_fund_tracker.py --help                  # 显示帮助信息")
             return
     
     # 可以通过参数调整并发数，默认10个并发
@@ -5316,6 +6836,9 @@ def main():
     # 获取监控基金数据
     log_info("\n🔍 获取监控基金数据...")
     monitor_funds = get_monitor_funds(max_workers=max_workers)
+    
+    # 初始化 profit_results（在条件块外初始化，避免作用域问题）
+    profit_results = None
     
     if self_selected_dict and monitor_funds:
         # 加载持仓数据
@@ -5348,6 +6871,7 @@ def main():
                 log_info("✅ 持仓数据已更新，使用最新数据计算收益")
         
         # 计算持仓收益（使用最新的持仓数据）
+        
         if holdings_data:
             log_info("\n💰 计算持仓收益...")
             try:
@@ -5357,6 +6881,7 @@ def main():
                 log_info("✅ 持仓信息已添加到自选基金数据中")
             except Exception as e:
                 log_info(f"⚠️  计算持仓收益失败: {e}")
+                profit_results = None
         else:
             log_info("⚠️  跳过持仓收益计算")
         
@@ -5430,6 +6955,19 @@ def create_flask_app():
         
         app = Flask(__name__)
         CORS(app)  # 允许跨域请求
+        
+        def _load_trades_from_file(user):
+            """读取交易JSON文件"""
+            try:
+                filepath = os.path.join('trades', f"{user}.json")
+                if not os.path.exists(filepath):
+                    return []
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                return data.get('trades', []) if isinstance(data, dict) else []
+            except Exception as e:
+                log_info(f"⚠️ 读取交易文件失败: {e}")
+                return []
         
         @app.route('/api/fund/history/<fund_code>')
         def get_fund_history(fund_code):
@@ -5547,6 +7085,44 @@ def create_flask_app():
                     'message': '批量获取基金数据时发生错误'
                 }), 500
         
+        @app.route('/api/fund/trades/<user>/<fund_code>')
+        def get_trades_by_fund(user, fund_code):
+            """按用户&基金获取交易记录"""
+            try:
+                trades = _load_trades_from_file(user)
+                fund_trades = [t for t in trades if t.get('fund_code') == fund_code]
+                return jsonify({
+                    'success': True,
+                    'user': user,
+                    'fund_code': fund_code,
+                    'data': fund_trades,
+                    'count': len(fund_trades)
+                })
+            except Exception as e:
+                return jsonify({
+                    'success': False,
+                    'error': str(e),
+                    'message': f'获取 {user}/{fund_code} 交易记录失败'
+                }), 500
+        
+        @app.route('/api/fund/trades/<user>')
+        def get_trades_by_user(user):
+            """按用户获取全部交易记录"""
+            try:
+                trades = _load_trades_from_file(user)
+                return jsonify({
+                    'success': True,
+                    'user': user,
+                    'data': trades,
+                    'count': len(trades)
+                })
+            except Exception as e:
+                return jsonify({
+                    'success': False,
+                    'error': str(e),
+                    'message': f'获取 {user} 交易记录失败'
+                }), 500
+        
         @app.route('/api/health')
         def health_check():
             """健康检查端点"""
@@ -5564,23 +7140,56 @@ def create_flask_app():
         print("💡 请安装Flask: pip install flask flask-cors")
         return None
 
-def run_api_server(host='127.0.0.1', port=5000, debug=True):
-    """运行API服务器"""
+def run_api_server(host='127.0.0.1', port=5000, debug=True, ssl_cert=None, ssl_key=None, use_https=False):
+    """运行API服务器，支持HTTP和HTTPS
+    
+    Args:
+        host: 服务器地址
+        port: 服务器端口
+        debug: 是否开启调试模式
+        ssl_cert: SSL证书文件路径（可选）
+        ssl_key: SSL私钥文件路径（可选）
+        use_https: 是否使用HTTPS（如果为True，需要提供证书和密钥）
+    """
     app = create_flask_app()
     if app:
         print(f"🚀 启动基金数据API服务器...")
-        print(f"🌐 服务地址: http://{host}:{port}")
+        
+        # 检查是否使用HTTPS
+        ssl_context = None
+        if use_https:
+            if ssl_cert and ssl_key:
+                import os
+                if os.path.exists(ssl_cert) and os.path.exists(ssl_key):
+                    ssl_context = (ssl_cert, ssl_key)
+                    print(f"🔒 使用HTTPS模式（证书: {ssl_cert}）")
+                else:
+                    print(f"⚠️  证书文件不存在，回退到HTTP模式")
+                    use_https = False
+            else:
+                print(f"⚠️  未提供SSL证书，回退到HTTP模式")
+                use_https = False
+        
+        protocol = 'https' if use_https else 'http'
+        print(f"🌐 服务地址: {protocol}://{host}:{port}")
         print(f"📊 API端点:")
         print(f"   - GET  /api/fund/history/<fund_code> - 获取基金历史净值")
         print(f"   - GET  /api/fund/realtime/<fund_code> - 获取基金实时数据")
         print(f"   - POST /api/fund/batch - 批量获取基金数据")
+        print(f"   - GET  /api/fund/trades/<user>/<fund_code> - 获取交易记录")
         print(f"   - GET  /api/health - 健康检查")
+        if not use_https:
+            print(f"💡 提示: 如需使用HTTPS，请提供SSL证书和密钥文件")
         print(f"💡 按 Ctrl+C 停止服务器")
         
         try:
-            app.run(host=host, port=port, debug=debug)
+            app.run(host=host, port=port, debug=debug, ssl_context=ssl_context)
         except KeyboardInterrupt:
             print("\n🛑 服务器已停止")
+        except Exception as e:
+            print(f"\n❌ 服务器启动失败: {e}")
+            if use_https:
+                print("💡 提示: 如果HTTPS启动失败，请检查证书文件路径和格式")
     else:
         print("❌ 无法启动API服务器")
 
@@ -5591,7 +7200,32 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         if sys.argv[1] == "--api":
             # 启动API服务器模式
-            run_api_server()
+            # 支持命令行参数：--api [--https] [--cert cert.pem] [--key key.pem] [--host 127.0.0.1] [--port 5000]
+            use_https = '--https' in sys.argv
+            ssl_cert = None
+            ssl_key = None
+            host = '127.0.0.1'
+            port = 5000
+            
+            # 解析命令行参数
+            if '--cert' in sys.argv:
+                idx = sys.argv.index('--cert')
+                if idx + 1 < len(sys.argv):
+                    ssl_cert = sys.argv[idx + 1]
+            if '--key' in sys.argv:
+                idx = sys.argv.index('--key')
+                if idx + 1 < len(sys.argv):
+                    ssl_key = sys.argv[idx + 1]
+            if '--host' in sys.argv:
+                idx = sys.argv.index('--host')
+                if idx + 1 < len(sys.argv):
+                    host = sys.argv[idx + 1]
+            if '--port' in sys.argv:
+                idx = sys.argv.index('--port')
+                if idx + 1 < len(sys.argv):
+                    port = int(sys.argv[idx + 1])
+            
+            run_api_server(host=host, port=port, use_https=use_https, ssl_cert=ssl_cert, ssl_key=ssl_key)
         elif sys.argv[1] == "--update":
             # 净值更新模式
             update_fund_values()
